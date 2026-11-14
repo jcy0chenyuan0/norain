@@ -45,3 +45,13 @@ Linux 服务端要求 systemd ≥ 243，因为 ADR 0013 使用 `ExecCondition=`�
 ## 确认
 
 - 2026-11-14，用户：服务端暂时不需要支持 Windows。其余按建议执行。
+
+## 修订
+
+2026-11-14，用户：**保留服务端的 Windows 支持。** 这取代上文「服务端暂不支持 Windows」的确认，回到最初目标（两端都兼容 Windows 和 Linux）。
+
+- 服务端在 Windows 上的实现：配置在 `%ProgramData%
+orain-server`，sing-box 在 `%ProgramFiles%
+orain-server`，开机计划任务（SYSTEM）运行 `norain-server run --if-desired` 自启，`setx /M` 写环境变量，`netsh advfirewall` 管理端口规则。
+- 不使用 Windows Service；守护进程被结束后由下次开机的计划任务拉起，期间没有外层保活。
+- 级别：Windows 10 22H2 / 11 amd64 为二级（代码已写，未验证）。

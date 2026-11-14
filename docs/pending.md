@@ -17,7 +17,7 @@
 | `status` JSON、`log [-f]`、轮转 | 状态日志 | 已写 | 早期版本测过 |
 | `config edit`、`fix` | 外控制 | 已写 | 未验证 |
 | install / update / uninstall、systemd 注册、profile.d | 部署更新 | 已写 | 未验证 |
-| Windows：路径、计划任务自启、setx、netsh | 部署更新 | 已写 | 未验证；与「服务端暂不支持 Windows」的早先答复冲突，待用户决定 |
+| Windows：路径、计划任务自启、setx、netsh | 部署更新 | 已写 | 未验证；用户已确认保留（ADR 0001 修订） |
 
 ## 客户端
 
