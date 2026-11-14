@@ -1,0 +1,43 @@
+# Norain 服务端 systemd 单元（参考样本）。`norain-server install` 会自动生成并注册等价的单元
+# （ExecStart 用安装时的 Python 解释器）。只有不想用 install 时才需要手动安装：
+#   1. 创建用户：  useradd --system --home /var/lib/norain-server --shell /usr/sbin/nologin norain
+#   2. 创建目录：  install -d -o norain -g norain -m 0750 /etc/norain-server /var/lib/norain-server /var/log/norain-server
+#   3. 复制本文件到 /etc/systemd/system/，按实际路径修改 ExecStart 等
+#   4. systemctl daemon-reload && systemctl enable norain-server
+# 回滚：systemctl disable --now norain-server && rm /etc/systemd/system/norain-server.service && systemctl daemon-reload
+#
+# 职责（docs/decisions/0012 修订）：Python 守护负责重启 sing-box（上限见 server.toml 的
+# restart_limit）；systemd 只在守护进程自身异常退出时把它拉起。
+# 本单元尚未在真实系统上验证。
+
+[Unit]
+Description=Norain server (sing-box supervisor)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=norain
+Group=norain
+EnvironmentFile=-/etc/norain-server/env
+# 用户手动 stop 之后（期望状态为 stopped），开机时跳过启动，不算失败
+ExecCondition=/usr/local/bin/norain-server _desired-state-is running
+ExecStart=/usr/local/bin/norain-server run
+Restart=on-failure
+RestartSec=5
+# 3=配置无效 5=缺少 sing-box 9=已达连续重启上限：这些情况再拉起也没用，避免无限循环
+RestartPreventExitStatus=3 5 9
+KillMode=mixed
+TimeoutStopSec=20
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/norain-server /var/log/norain-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+# Norain 服务端配置示例。未知字段会被拒绝。
+# 也可以不手写：norain-server install 会生成一份（支持 NORAIN_DOMAIN、NORAIN_HY2_PORT、
+# NORAIN_TROJAN_PORT、NORAIN_CERT_MODE、NORAIN_PASSWORD 环境变量注入）。
+# 默认位置：/etc/norain-server/server.toml（可用 NORAIN_SERVER_CONFIG 指定）
+schema = 1
+
+[server]
+domain = "example.com"        # 证书对应的域名或 IP
+listen = "::"                 # 监听地址；只要 IPv4 时写 "0.0.0.0"
+
+[protocols.hysteria2]
+enabled = true
+port = 443                    # UDP
+
+[protocols.trojan]
+enabled = false
+port = 443                    # TCP
+# fallback = { host = "127.0.0.1", port = 8080 }   # 可选；不写则不启用
+
+[auth]
+# 运行 `norain-server secret generate` 生成密码文件
+credential_ref = "file:/etc/norain-server/secrets/password"
+# 也可以写 env:NORAIN_PASSWORD，或直接写 password = "…"（此时本文件权限必须是 0600）
+
+[tls]
+mode = "manual"               # manual | self-signed | acme
+certificate = "/etc/norain-server/tls/fullchain.pem"
+private_key = "/etc/norain-server/tls/privkey.pem"
+# self-signed：先运行 `norain-server cert self-signed --domain <域名>`，
+# 然后把 mode 改为 "self-signed"，并删除上面两行
+# acme：需要域名，且 80/tcp 能从公网访问（HTTP-01）；删除上面两行，可选填 email = "you@example.com"
+
+[service]
+check_interval_seconds = 30   # 健康检查间隔
+restart_limit = 3             # sing-box 连续重启上限
+restart_backoff_seconds = 2   # 重启前等待，逐次翻倍
+
+[logging]
+directory = ""                # 留空用 /var/log/norain-server
+level = "info"
+max_size_mb = 20
+retain_files = 5

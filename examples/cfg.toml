@@ -1,0 +1,94 @@
+# Norain 客户端配置示例。未知字段会被拒绝。
+# 位置：Windows 为 %APPDATA%\norain\cfg.toml，Linux 为 ~/.config/norain/cfg.toml
+# 也可以不手写：norain install 会生成一份，之后用 norain config … / norain list … 修改。
+schema = 1
+
+[app]
+mode = "normal"               # normal：开机自启动；safe（安全模式）：不自启动，只手动 norain start
+auto_start = true
+
+[local]
+listen = "127.0.0.1"          # 本地代理地址（HTTP 和 SOCKS5 共用一个端口）
+port = 2080
+probe_port = 2090             # 监控 / 分流 / 选协议用的本地探测入口，占用连续 3 个端口
+
+[proxy]
+protocol = "auto"             # auto（按测速和连通性自适应）| hysteria2 | trojan
+server = "example.com"        # 代理服务器域名或 IP
+traffic_mode = "tun"          # tun：全局接管（需要管理员权限）| mixed：只有本地代理 | system-proxy
+# 密码三选一：
+#   credential_ref = "file:<密码文件路径>"   文件第一行是密码
+#   credential_ref = "env:NORAIN_PASSWORD"
+#   password = "…"                            直接写（Linux 上本文件权限必须是 0600）
+credential_ref = "env:NORAIN_PASSWORD"
+
+[proxy.hysteria2]
+port = 443
+
+[proxy.trojan]
+port = 443
+
+[proxy.tls]
+server_name = ""              # 留空则使用 proxy.server
+certificate_path = ""         # 服务端用自签证书时，填从服务器拷贝来的证书文件路径
+insecure = false              # true 会跳过证书校验，不安全
+
+[proxy.selection]             # 只在 protocol = "auto" 时使用
+interval_seconds = 60         # 测速间隔
+failure_threshold = 3         # 当前协议连续失败这么多次就立即切换
+latency_ratio = 1.3           # 延迟中位数差到这个倍数……
+latency_margin_ms = 100       # ……并且差值超过这么多毫秒才切换
+cooldown_seconds = 600        # 两次切换的最小间隔
+prefer = "hysteria2"          # 指标相当时优先用哪个
+
+[tun]                         # 只在 traffic_mode = "tun" 时使用
+interface_name = "norain0"
+address = ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
+mtu = 9000
+strict_route = true
+
+[routing]
+proxy_domains = []            # 白名单：强制走代理，DNS 由服务器侧解析
+direct_domains = []           # 黑名单：强制直连，DNS 用国内服务器
+isolation_allowlist = []      # 蓝名单：阻断模式下仍允许的连接（域名、IP 或 CIDR）
+# 条目写法：example.com（含子域名）、full:example.com（精确匹配）、1.2.3.4、10.0.0.0/8
+rule_set = ["geosite-cn", "geoip-cn"]   # 判为「国内 → 直连」的规则集；文件缺失时自动跳过
+default_action = "proxy"      # 没有命中任何规则的流量：proxy | direct
+learn = true                  # 访问失败的域名按「试连 → 改判 → 加入名单」自动学习
+update_interval_hours = 24    # 规则集自更新间隔，0 表示不自动更新
+allow_lan_in_isolation = true # 阻断模式下是否放行局域网
+
+[dns]
+mode = "split"                # split：国内域名用国内 DNS，其余经代理解析 | proxy：全部经代理 | local：系统 DNS
+domestic = "223.5.5.5"
+proxy = "https://1.1.1.1/dns-query"
+strategy = "prefer_ipv4"
+cache_ttl_seconds = 300       # 分流模块学到的解析结果保留多久
+
+[monitor]
+enabled = true
+interval_seconds = 30
+timeout_seconds = 5
+failure_threshold = 3         # 同一个错误码连续出现这么多次才上报（防抖动）
+recovery_threshold = 2
+home_country = "CN"           # 「国内位置」的国家代码
+domestic_targets = ["https://www.baidu.com", "https://www.qq.com", "https://www.taobao.com"]
+foreign_targets = ["https://www.google.com/generate_204", "https://www.youtube.com",
+                   "https://github.com", "https://www.wikipedia.org"]
+
+[maintain]
+scan_interval_seconds = 5
+repair_attempts = 2           # 每个故障最多修复几轮，仍然不行就进入阻断模式
+block_on_failure = true       # 修复失败时自动切断网络（只保留蓝名单），防止直连暴露真实 IP
+watchdog = true               # 与看门狗进程互拉保活
+
+[supervisor]
+check_interval_seconds = 30
+restart_limit = 3
+backoff_seconds = 5
+
+[logging]
+directory = ""
+level = "info"                # 分流学习依赖 sing-box 的 info 级别日志，调高后学习会失效
+max_size_mb = 20
+retain_files = 5

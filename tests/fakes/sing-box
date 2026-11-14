@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""测试用的模拟 sing-box。只模拟 Norain 用到的三个子命令的外部行为：
+
+  version            输出版本和构建标签
+  check -c <配置>    解析 JSON，做最基本的结构检查
+  run -c <配置>      按 inbounds 监听端口，直到收到 SIGTERM
+
+它不是 sing-box，不验证任何真实字段语义。通过环境变量注入故障：
+  FAKE_SB_VERSION、FAKE_SB_TAGS、FAKE_SB_CHECK_FAIL=1、
+  FAKE_SB_CRASH=1（启动后立即退出）、FAKE_SB_CRASH_ONCE=<标记文件>（只崩溃第一次）、
+  FAKE_SB_NO_LISTEN=1（不监听端口）、FAKE_SB_FATAL=1（输出 FATAL 日志但不退出）
+"""
+import json
+import os
+import signal
+import socket
+import sys
+import time
+
+args = sys.argv[1:]
+env = os.environ
+
+
+def config():
+    return json.load(open(args[args.index("-c") + 1], encoding="utf-8"))
+
+
+if args[:1] == ["version"]:
+    print(f"sing-box version {env.get('FAKE_SB_VERSION', '1.14.4')}\n")
+    print("Environment: go1.25.0 linux/amd64")
+    print(f"Tags: {env.get('FAKE_SB_TAGS', 'with_quic,with_acme,with_utls')}")
+    sys.exit(0)
+
+if args[:1] == ["check"]:
+    doc = config()
+    def password():
+        for ib in doc.get("inbounds", []):
+            for u in ib.get("users", []):
+                return u["password"]
+        for ob in doc.get("outbounds", []):
+            if "password" in ob:
+                return ob["password"]
+
+    if env.get("FAKE_SB_CHECK_FAIL"):
+        print(f'FATAL[0000] decode config: bad password "{password()}"', file=sys.stderr)
+        sys.exit(1)
+    files = []
+    for ib in doc["inbounds"]:
+        assert ib["type"] in ("hysteria2", "trojan", "mixed", "tun"), ib["type"]
+        if ib["type"] not in ("mixed", "tun"):
+            assert ib["users"] and ib["tls"]["enabled"]
+            files += [ib["tls"]["certificate_path"], ib["tls"]["key_path"]]
+    for ob in doc["outbounds"]:
+        assert ob["type"] in ("hysteria2", "trojan", "direct"), ob["type"]
+        if ob["type"] != "direct":
+            assert ob["server"] and ob["server_port"] and ob["password"] and ob["tls"]["enabled"]
+            files += [ob["tls"]["certificate_path"]] if "certificate_path" in ob["tls"] else []
+    tags = {o["tag"] for o in doc["outbounds"]}
+    assert doc["route"]["final"] in tags
+    for f in files:
+        if not os.path.isfile(f):
+            print(f"FATAL[0000] open {f}: no such file", file=sys.stderr)
+            sys.exit(1)
+    sys.exit(0)
+
+if args[:1] == ["run"]:
+    doc = config()
+    once = env.get("FAKE_SB_CRASH_ONCE")
+    if env.get("FAKE_SB_CRASH") or (once and not os.path.exists(once)):
+        if once:
+            open(once, "w").close()
+        print("FATAL[0000] start service: simulated crash", flush=True)
+        sys.exit(1)
+    socks = []
+    if not env.get("FAKE_SB_NO_LISTEN"):
+        for ib in doc["inbounds"]:
+            if ib["type"] == "tun":
+                continue
+            fam = socket.AF_INET6 if ":" in ib["listen"] else socket.AF_INET
+            kind = socket.SOCK_DGRAM if ib["type"] == "hysteria2" else socket.SOCK_STREAM
+            s = socket.socket(fam, kind)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((ib["listen"], ib["listen_port"]))
+            if kind == socket.SOCK_STREAM:
+                s.listen()
+            socks.append(s)
+    print("INFO[0000] sing-box started (fake)", flush=True)
+    if env.get("FAKE_SB_FATAL"):
+        print("FATAL[0001] simulated fatal while running", flush=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    while True:
+        time.sleep(0.2)
+
+if args[:2] == ["rule-set", "match"]:
+    sys.exit(0)  # 不输出任何匹配
+
+print("unknown command", file=sys.stderr)
+sys.exit(2)

@@ -1,0 +1,41 @@
+# sing-box 版本锁定文件。决策依据见 docs/decisions/0002-singbox-version-pin.md。
+# 规则：
+#   1. 只锁定稳定版，不追踪 latest，不使用 alpha/beta/rc。
+#   2. 升级必须同时更新本文件、ADR 0002 和 TOML→JSON 映射测试夹具。
+#   3. 安装器下载后先比对 sha256，再执行 `sing-box version` 核对版本号和构建标签，
+#      两项都通过才允许安装。
+
+[singbox]
+version = "1.14.4"
+channel = "stable"
+release_date = "2026-10-24"
+release_url = "https://github.com/SagerNet/sing-box/releases/tag/v1.14.4"
+schema_docs = "https://sing-box.sagernet.org/configuration/"
+# 上游不提供独立的 checksum/签名文件，只在发布页显示每个资产的 SHA-256 摘要，
+# 另附 GitHub release attestation。
+hash_source = "GitHub 发布页资产摘要，2026-11-14 记录"
+attestation_check = "gh attestation verify <文件> --repo SagerNet/sing-box"
+# 以下摘要是从发布页读取后转录的，阶段 1 首次下载时必须逐一复核，
+# 复核通过后把 hashes_verified 改为 true，并在 ADR 0002 记录复核日期。
+hashes_verified = false
+# 服务端必需：Hysteria2 依赖 QUIC；ACME 模式另需 with_acme。
+required_build_tags = ["with_quic"]
+required_build_tags_acme = ["with_acme"]
+
+# 首选不带 glibc/musl 后缀的通用包。三种 Linux 变体的区别尚未核实，
+# 见 ADR 0002「待验证」。
+[singbox.assets.linux-amd64]
+file = "sing-box-1.14.4-linux-amd64.tar.gz"
+sha256 = "699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968"
+
+[singbox.assets.linux-arm64]
+file = "sing-box-1.14.4-linux-arm64.tar.gz"
+sha256 = "436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26"
+
+[singbox.assets.windows-amd64]
+file = "sing-box-1.14.4-windows-amd64.zip"
+sha256 = "99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df"
+
+[singbox.assets.windows-arm64]
+file = "sing-box-1.14.4-windows-arm64.zip"
+sha256 = "8cd0a4d0cd8cd480be5731ac31f17038969a42d12add9feb6e031fd43d85bbae"
