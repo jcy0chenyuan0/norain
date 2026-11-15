@@ -44,7 +44,7 @@ def test_validate_start_status_stop_chain(server):
     out = server.cli("config", "show").stdout + json.dumps(st) + server.cli("log").stdout
     assert PASSWORD not in out
     for p in server.logs.iterdir():
-        assert PASSWORD not in p.read_text()
+        assert PASSWORD not in p.read_text(encoding="utf-8", errors="replace")
 
     child = st["process"]["pid"]
     assert server.cli("stop").returncode == 0
@@ -72,7 +72,7 @@ def test_restart_limit_stops_restarting(server):
     assert r.returncode != 0
     st = wait_for(lambda: (s := server.status())["service"]["state"] == "stopped" and s)
     assert st["business_code"] == 160 and st["desired"] == "running"
-    log = (server.logs / "norain-server.log").read_text()
+    log = (server.logs / "norain-server.log").read_text(encoding="utf-8", errors="replace")
     assert log.count('"singbox.started"') == 3  # 首次 + 2 次重启
     assert '"daemon.restart_limit"' in log
 
@@ -82,11 +82,11 @@ def test_health_check_detects_missing_listener_and_fatal(server):
     r = server.cli("start", "--json", env={"FAKE_SB_NO_LISTEN": "1"})
     assert r.returncode != 0  # 从未就绪，start 不能报成功
     st = wait_for(lambda: (s := server.status())["service"]["state"] == "stopped" and s)
-    assert "端口没有在监听" in (server.logs / "norain-server.log").read_text()
+    assert "端口没有在监听" in (server.logs / "norain-server.log").read_text(encoding="utf-8", errors="replace")
     assert st["business_code"] == 160
     server.cli("stop")
     server.cli("start", env={"FAKE_SB_FATAL": "1"})
-    wait_for(lambda: "日志出现 fatal" in (server.logs / "norain-server.log").read_text())
+    wait_for(lambda: "日志出现 fatal" in (server.logs / "norain-server.log").read_text(encoding="utf-8", errors="replace"))
 
 
 def test_start_refuses_bad_config_and_port_in_use(server):

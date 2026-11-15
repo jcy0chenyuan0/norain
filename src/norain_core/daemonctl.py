@@ -60,6 +60,30 @@ def _kill(pid: int | None) -> None:
         pass
 
 
+def _kill_tree(pid: int | None) -> None:
+    """终止守护进程及其包装器/子进程，避免 Windows 启动器留下孤儿。"""
+    if not pid:
+        return
+    try:
+        proc = psutil.Process(pid)
+        children = proc.children(recursive=True)
+    except psutil.Error:
+        children = []
+    for child in reversed(children):
+        try:
+            child.kill()
+        except psutil.Error:
+            pass
+    _kill(pid)
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class DetachedBackend:
     """没有外层保活：守护进程自身被结束后不会恢复。"""
 
@@ -108,6 +132,26 @@ class DetachedBackend:
                     and alive(info.get("child_pid"))):
                 return
             time.sleep(0.1)
+        # 超时：先请守护进程自己停（停止请求文件），再强杀，避免留下孤儿进程占着端口、
+        # 稍后又被看门狗或开机自启动拉起来，而用户看到的是「启动失败」
+        try:
+            self.stop_file.parent.mkdir(parents=True, exist_ok=True)
+            self.stop_file.write_text("stop\n", encoding="utf-8")
+        except OSError:
+            pass
+        info = runner_info(self.runner_file)
+        try:
+            proc.terminate()
+            proc.wait(5)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        # If the supervisor was a wrapper process, terminating it may leave the
+        # child sing-box alive. Use the last runner record as a second cleanup path.
+        if info and info.get("pid") == proc.pid:
+            _kill_tree(proc.pid)
         raise NorainError("启动超时：sing-box 在限定时间内没有开始监听端口", exit_code=EXIT_TIMEOUT,
                           module="daemon", retryable=True, hint="查看日志了解详情")
 
@@ -143,7 +187,6 @@ class DetachedBackend:
                 break
             time.sleep(0.1)
         else:
-            _kill(pid)
-            _kill(info.get("child_pid"))
-        self.runner_file.unlink(missing_ok=True)
-        self.stop_file.unlink(missing_ok=True)
+            _kill_tree(pid)
+        _unlink_quiet(self.runner_file)
+        _unlink_quiet(self.stop_file)

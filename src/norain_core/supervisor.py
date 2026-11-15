@@ -103,6 +103,20 @@ def record_error(path: Path, business_code: int, message: str) -> None:
         pass
 
 
+def _safe_unlink(path: Path, *, attempts: int = 4) -> None:
+    """删除短生命周期的状态文件，不让 Windows 的短暂文件锁打崩守护进程。"""
+    for n in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if n + 1 == attempts:
+                return
+            time.sleep(0.05)
+
+
 class Supervisor:
     def __init__(self, spec: Spec) -> None:
         self.spec = spec
@@ -127,7 +141,7 @@ class Supervisor:
         rf = self.spec.reload_file
         hit = self._reload.is_set()
         if rf is not None and rf.exists():
-            rf.unlink(missing_ok=True)
+            _safe_unlink(rf)
             hit = True
         self._reload.clear()
         return hit
@@ -155,13 +169,38 @@ class Supervisor:
 
     @staticmethod
     def _terminate(child: subprocess.Popen) -> None:
+        # 先记下整棵子孙树：Windows 上子进程可能是个启动器（.cmd、包装脚本、
+        # 安装器壳）。即使启动器已经退出，真正的进程也可能还占着端口。
+        try:
+            procs = psutil.Process(child.pid).children(recursive=True)
+        except (psutil.Error, OSError):
+            procs = []
         if child.poll() is None:
-            child.terminate()
+            try:
+                child.terminate()
+            except OSError:
+                pass
             try:
                 child.wait(STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(5)
+                try:
+                    child.kill()
+                    child.wait(5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        for p in procs:
+            try:
+                if p.is_running():
+                    p.terminate()
+            except (psutil.Error, OSError):
+                continue
+            try:
+                p.wait(2)
+            except (psutil.TimeoutExpired, OSError):
+                try:
+                    p.kill()
+                except (psutil.Error, OSError):
+                    pass
 
     def _write_runner(self, child_pid: int | None, consecutive: int, ready: bool = False) -> None:
         write_json(self.spec.runner_file, {
@@ -220,9 +259,9 @@ class Supervisor:
         spec = self.spec
         sink = RotatingFile(spec.log_file, max_bytes=spec.log_max_bytes, keep=spec.log_keep)
         log = Logger("daemon", sink=sink, level=spec.log_level)
-        spec.stop_file.unlink(missing_ok=True)
+        _safe_unlink(spec.stop_file)
         if spec.reload_file is not None:
-            spec.reload_file.unlink(missing_ok=True)
+            _safe_unlink(spec.reload_file)
         try:
             signal.signal(signal.SIGTERM, self.request_stop)
             signal.signal(signal.SIGINT, self.request_stop)
@@ -280,5 +319,5 @@ class Supervisor:
         finally:
             if self._child is not None:
                 self._terminate(self._child)
-            spec.runner_file.unlink(missing_ok=True)
-            spec.stop_file.unlink(missing_ok=True)
+            _safe_unlink(spec.runner_file)
+            _safe_unlink(spec.stop_file)

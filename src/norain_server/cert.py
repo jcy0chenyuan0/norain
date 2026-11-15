@@ -38,12 +38,28 @@ class CertStatus:
     def as_dict(self) -> dict:
         return {"ok": self.ok, **self.__dict__}
 
-    def raise_if_invalid(self) -> None:
+    def raise_if_invalid(self, *, message: str = "证书无效", hint: str = "") -> None:
         if self.errors:
             raise NorainError(
-                "证书无效", exit_code=EXIT_CONFIG, business_code=BIZ_CERT, module="cert",
+                message, exit_code=EXIT_CONFIG, business_code=BIZ_CERT, module="cert",
                 field_errors=[FieldError("tls", e) for e in self.errors],
-                hint="manual 模式检查证书路径；自用可运行 cert self-signed --domain <域名>")
+                hint=hint or "manual 模式检查证书路径；自用可运行 cert self-signed --domain <域名>")
+
+
+def raise_for_mode(mode: str, status: CertStatus) -> None:
+    """按证书模式抛出「无效」错误。
+
+    acme 的失败多是环境前置条件（域名、80/tcp、构建标签），不能沿用 manual 模式
+    的「检查证书路径 / 生成自签证书」提示；报错文案也要区分开，否则调用方拿着
+    BIZ_CERT 去看一个根本不存在的证书文件。
+    """
+    if mode == "acme":
+        status.raise_if_invalid(
+            message="ACME 前置条件不满足",
+            hint="检查域名解析、80/tcp 是否可用、sing-box 是否带 with_acme 构建标签；"
+                 "启用 Trojan 且监听 443/tcp 可改用 TLS-ALPN-01")
+    else:
+        status.raise_if_invalid()
 
 
 def _matches(domain: str, cert: x509.Certificate) -> bool:
@@ -81,7 +97,8 @@ def check(cert_path: Path, key_path: Path, domain: str, *, now: dt.datetime | No
     try:
         key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
         if os.name == "posix" and key_path.stat().st_mode & 0o077:
-            st.warnings.append(f"私钥文件权限过宽：{key_path}，建议 chmod 600")
+            # ADR 0014：私钥必须只有属主可读。以前只警告，服务照样起来用 0644 的私钥
+            st.errors.append(f"私钥文件权限过宽：{key_path}，执行 chmod 600 后重试")
     except FileNotFoundError:
         st.errors.append(f"私钥文件不存在：{key_path}")
     except PermissionError:
@@ -104,8 +121,9 @@ def check(cert_path: Path, key_path: Path, domain: str, *, now: dt.datetime | No
     if not _matches(domain, cert):
         st.errors.append(f"证书的 SAN 不包含 {domain}")
     if key is not None:
-        pub = lambda k: k.public_bytes(serialization.Encoding.DER,
-                                       serialization.PublicFormat.SubjectPublicKeyInfo)
+        def pub(k):
+            return k.public_bytes(serialization.Encoding.DER,
+                                  serialization.PublicFormat.SubjectPublicKeyInfo)
         if pub(cert.public_key()) != pub(key.public_key()):
             st.errors.append("证书与私钥不匹配")
     if st.self_signed:
@@ -125,11 +143,17 @@ def _generate_openssl(domain: str, cert_path: Path, key_path: Path, days: int) -
     exe = shutil.which("openssl")
     if not exe:
         return False
-    proc = subprocess.run(
-        [exe, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
-         "-days", str(days), "-subj", f"/CN={domain}", "-addext", f"subjectAltName={_san(domain)}",
-         "-keyout", str(key_path), "-out", str(cert_path)],
-        capture_output=True, text=True, timeout=30)
+    try:
+        proc = subprocess.run(
+            [exe, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+             "-days", str(days), "-subj", f"/CN={domain}", "-addext", f"subjectAltName={_san(domain)}",
+             "-keyout", str(key_path), "-out", str(cert_path)],
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    except (OSError, subprocess.SubprocessError):
+        # An executable can be present in PATH but still fail to start or time
+        # out. The cryptography implementation is the supported offline fallback.
+        return False
     return proc.returncode == 0
 
 
@@ -158,6 +182,9 @@ def self_signed(domain: str, cert_path: Path, key_path: Path, *, days: int = 365
     """生成自签证书。优先用 openssl（最初目标），没有时用 cryptography。返回（状态，生成方式）。"""
     if not domain.strip():
         raise NorainError("--domain 不能为空", exit_code=2, module="cert")
+    if days <= 0:
+        # 不拦的话 --days 0 会生成一张「已过期」的证书并以成功退出
+        raise NorainError("--days 必须是正整数", exit_code=2, module="cert")
     if (cert_path.exists() or key_path.exists()) and not force:
         raise NorainError(f"{cert_path} 或 {key_path} 已存在。确认要覆盖时加 --force",
                           exit_code=EXIT_CONFLICT, module="cert")
@@ -196,18 +223,31 @@ def _port80_busy() -> bool:
 
 
 def acme_status(domain: str, acme_dir: Path, *, tags: frozenset[str] | None = None,
-                service_running: bool = False, now: dt.datetime | None = None) -> CertStatus:
+                tags_unknown: bool = False,
+                service_running: bool = False, tls_alpn01: bool = False,
+                now: dt.datetime | None = None) -> CertStatus:
     """acme 模式的检查。证书由 sing-box 内置 ACME 申请和续期，Norain 只检查前置条件；
-    在数据目录里找到已签发的证书时报告有效期。"""
+    在数据目录里找到已签发的证书时报告有效期。
+
+    ``tls_alpn01`` 表示 443/tcp 上有一个 TLS 监听（Trojan），此时 TLS-ALPN-01 与
+    HTTP-01 互为备份（ADR 0015），80/tcp 被占用只降级为警告。
+    """
     st = CertStatus("(acme)", "(acme)")
     now = now or dt.datetime.now(dt.timezone.utc)
     if not domain.strip():
         st.errors.append("acme 模式需要域名（server.domain）")
-    if tags is not None and "with_acme" not in tags:
+    if tags_unknown:
+        # 拿不到标签不等于「带 with_acme」：找不到二进制时不能报前置条件通过
+        st.errors.append("找不到 sing-box，无法确认 with_acme 构建标签")
+    elif tags is not None and "with_acme" not in tags:
         st.errors.append("当前 sing-box 不带 with_acme 构建标签，无法使用 acme 模式")
     if not service_running and _port80_busy():
-        st.warnings.append("80/tcp 已被其他程序占用，HTTP-01 挑战可能失败"
-                           "（让 Trojan 监听 443/tcp 可改走 TLS-ALPN-01）")
+        if tls_alpn01:
+            st.warnings.append("80/tcp 已被其他程序占用，HTTP-01 挑战不可用；"
+                               "将依赖 443/tcp 上的 TLS-ALPN-01 挑战")
+        else:
+            st.errors.append("80/tcp 已被其他程序占用，HTTP-01 挑战无法使用；"
+                             "启用 Trojan 并监听 443/tcp 可改用 TLS-ALPN-01，或后续配置 DNS-01")
     issued = None
     try:
         for f in acme_dir.rglob("*.crt"):

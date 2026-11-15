@@ -97,8 +97,12 @@ def _outbound(cfg: ClientConfig, protocol: str, password: str, tag: str) -> dict
         tls["certificate_path"] = str(Path(p.tls.certificate_path).expanduser())
     if p.tls.insecure:
         tls["insecure"] = True
-    return {"type": protocol, "tag": tag, "server": p.server, "server_port": p.port_of(protocol),
-            "password": password, "tls": tls}
+    out: dict = {"type": protocol, "tag": tag, "server": p.server, "server_port": p.port_of(protocol),
+                 "password": password, "tls": tls}
+    if protocol == "trojan" and p.trojan.multiplex.enabled:  # 与原来那套代理一致：smux / 8
+        m = p.trojan.multiplex
+        out["multiplex"] = {"enabled": True, "protocol": m.protocol, "max_streams": m.max_streams}
+    return out
 
 
 def _dns_server(tag: str, address: str, *, detour: str | None, resolver: str) -> dict:

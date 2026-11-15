@@ -248,6 +248,10 @@ class Router:
         if not m:
             return
         tag, host = self._conns.pop(m.group(1), (None, None))
+        if tag == "proxy-alt":
+            # Auto mode uses proxy-alt for the non-selected protocol. It is
+            # still a proxied path and must participate in post-failure learning.
+            tag = "proxy"
         if not host or tag not in ("direct", "proxy") or _looks_like_ip(host):
             return
         self._fails[host] = self._fails.get(host, 0) + 1

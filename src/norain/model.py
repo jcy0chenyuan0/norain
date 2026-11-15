@@ -1,5 +1,9 @@
 """cfg.toml 配置模型。没有实现的取值在校验时明确拒绝（目前只有 traffic_mode = "transparent"）。
 
+加载顺序是「迁移 → 字段校验 → 交叉校验」：Schema 版本策略和逐级迁移在
+``norain_core.migrate``，本模块只取结果；迁移产生的 warning 挂在配置对象上，
+由 ``warnings_of`` 统一展示。
+
 名单的含义（docs/decisions/0007）：
   routing.proxy_domains        白名单：强制走代理，DNS 由服务器侧解析
   routing.direct_domains       黑名单：强制直连，DNS 用国内服务器
@@ -17,13 +21,16 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator
 
 from norain_core.errors import BIZ_CONFIG, EXIT_CONFIG, FieldError, NorainError, config_error
+from norain_core.migrate import (SCHEMA_VERSION, MigrationResult, attach_warnings, migrate,
+                                migration_warnings)
 from norain_core.redact import REDACTOR
 from norain_core.secrets import check_private_file
 
-SCHEMA_VERSION = 1
+from . import defaults
+
 PROTOCOLS = ("hysteria2", "trojan")
 KNOWN_RULE_SETS = ("geosite-cn", "geoip-cn")
 
@@ -56,6 +63,20 @@ class ProtoPort(_Strict):
     port: int = Field(443, ge=1, le=65535)
 
 
+class Multiplex(_Strict):
+    """trojan 的多路复用。默认值与原来那套代理一致（smux / 8 条流）。
+
+    hysteria2 不走这里：它是 QUIC 上的原生协议，sing-box 不支持也不需要对它多路复用。
+    """
+    enabled: bool = True
+    protocol: Literal["smux", "yamux", "h2mux"] = "smux"
+    max_streams: int = Field(8, ge=1, le=128)
+
+
+class Trojan(ProtoPort):
+    multiplex: Multiplex = Multiplex()
+
+
 class ProxyTls(_Strict):
     server_name: str = ""          # 留空时用 proxy.server
     certificate_path: str = ""     # 服务端用自签证书时，填这张证书的路径
@@ -80,7 +101,7 @@ class Proxy(_Strict):
     password: str = ""
     traffic_mode: Literal["mixed", "system-proxy", "tun", "transparent"] = "mixed"
     hysteria2: ProtoPort = ProtoPort()
-    trojan: ProtoPort = ProtoPort()
+    trojan: Trojan = Trojan()
     tls: ProxyTls = ProxyTls()
     selection: Selection = Selection()
 
@@ -100,9 +121,9 @@ class Tun(_Strict):
 
 
 class Routing(_Strict):
-    proxy_domains: list[str] = []        # 白名单：强制走代理
-    direct_domains: list[str] = []       # 黑名单：强制直连
-    isolation_allowlist: list[str] = []  # 蓝名单：阻断模式下仍允许
+    proxy_domains: list[str] = list(defaults.PROXY_DOMAINS)            # 白名单：强制走代理
+    direct_domains: list[str] = list(defaults.DIRECT_DOMAINS)          # 黑名单：强制直连
+    isolation_allowlist: list[str] = list(defaults.ISOLATION_ALLOWLIST)  # 蓝名单：阻断模式下仍允许
     rule_set: list[str] = list(KNOWN_RULE_SETS)   # 判为「国内 → 直连」的规则集；文件缺失时自动跳过
     default_action: Literal["proxy", "direct"] = "proxy"
     learn: bool = True                   # 按最初目标的试连流程自动改判并加入名单
@@ -156,6 +177,7 @@ class Logging(_Strict):
 
 
 class ClientConfig(_Strict):
+    _config_warnings: list[str] = PrivateAttr(default_factory=list)
     schema_version: int = Field(SCHEMA_VERSION, alias="schema")
     app: App = App()
     local: Local = Local()
@@ -252,13 +274,13 @@ def entry_key(e: str) -> str:
 
 def _cross_checks(cfg: ClientConfig) -> list[FieldError]:
     errs: list[FieldError] = []
-    if cfg.schema_version != SCHEMA_VERSION:
-        errs.append(FieldError("schema", f"不支持的配置版本 {cfg.schema_version}，本程序支持 {SCHEMA_VERSION}"))
     if cfg.proxy.traffic_mode == "transparent":
         errs.append(FieldError("proxy.traffic_mode",
                                "transparent 尚未实现；全局接管请用 tun，其余可用 mixed 或 system-proxy"))
     if not cfg.proxy.server.strip():
         errs.append(FieldError("proxy.server", "不能为空（代理服务器的域名或 IP）"))
+    if not cfg.proxy.password and not cfg.proxy.credential_ref and not os.environ.get("NORAIN_PASSWORD"):
+        errs.append(FieldError("proxy.credential_ref", "不能为空（使用 file:<路径>、env:<变量名> 或 NORAIN_PASSWORD）"))
     if cfg.proxy.password and cfg.proxy.credential_ref:
         errs.append(FieldError("proxy", "password 和 credential_ref 只能设置一个"))
     cert = cfg.proxy.tls.certificate_path
@@ -285,6 +307,11 @@ def _cross_checks(cfg: ClientConfig) -> list[FieldError]:
     for name in ("proxy", "domestic_doh", "public_doh"):
         value = getattr(cfg.dns, name)
         u = urlsplit(value)
+        try:
+            u.port          # 非法端口（例如 :bad）会让 urlsplit 抛 ValueError
+        except ValueError:
+            errs.append(FieldError(f"dns.{name}", "端口不是有效的数字"))
+            continue
         is_ip = False
         try:
             ipaddress.ip_address(value)
@@ -310,16 +337,27 @@ def _cross_checks(cfg: ClientConfig) -> list[FieldError]:
     return errs
 
 
-def parse(data: dict) -> ClientConfig:
-    """校验一份已经解析成字典的配置（不检查文件权限）。"""
+def parse(data: dict, *, source: str = "cfg.toml") -> ClientConfig:
+    """迁移并校验一份已经解析成字典的配置（不检查文件权限）。"""
+    migration = migrate(data, current=SCHEMA_VERSION, source=source)
     try:
-        cfg = ClientConfig.model_validate(data)
+        cfg = ClientConfig.model_validate(migration.data)
     except ValidationError as e:
         raise config_error([_translate(x) for x in e.errors()]) from None
+    attach_warnings(cfg, migration)
     errs = _cross_checks(cfg)
     if errs:
         raise config_error(errs)
     return cfg
+
+
+def migrate_doc(data: dict, *, source: str = "cfg.toml") -> MigrationResult:
+    """只做 Schema 迁移、不校验字段：写盘前用它拿到要落盘的数据。
+
+    命令行改配置时会重写整个文件，顺手把迁移结果写进去，否则「缺少 schema」
+    的 warning 每次加载都会再出现一遍。
+    """
+    return migrate(data, current=SCHEMA_VERSION, source=source)
 
 
 def read_raw(path: Path) -> dict:
@@ -337,7 +375,7 @@ def read_raw(path: Path) -> dict:
 
 
 def load_config(path: Path) -> ClientConfig:
-    cfg = parse(read_raw(path))
+    cfg = parse(read_raw(path), source=str(path))
     if cfg.proxy.password:
         REDACTOR.register(cfg.proxy.password)
         try:
@@ -349,7 +387,8 @@ def load_config(path: Path) -> ClientConfig:
 
 
 def warnings_of(cfg: ClientConfig) -> list[str]:
-    out = []
+    """这份配置值得提醒用户的全部事情：迁移 warning 加上取值、运行模式的提示。"""
+    out = migration_warnings(cfg)
     if cfg.proxy.tls.insecure:
         out.append("proxy.tls.insecure = true：不校验服务端证书，连接可能被中间人劫持")
     if cfg.local.listen not in ("127.0.0.1", "::1"):

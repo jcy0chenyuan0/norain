@@ -80,6 +80,7 @@ def test_env_overrides(server):
     assert "环境变量 NORAIN_HY2_PORT" in errors_of(server, env={"NORAIN_HY2_PORT": "abc"})
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有 0600 权限语义，产品本身也不检查（HANDOFF 已知问题）")
 def test_secret_missing_and_permissions(server):
     server.secret.chmod(0o644)
     with pytest.raises(NorainError) as ei:
@@ -93,6 +94,7 @@ def test_secret_missing_and_permissions(server):
         resolve("keyring:x/y")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有 0600 权限语义，产品本身也不检查（HANDOFF 已知问题）")
 def test_inline_password_requires_private_config(server):
     server.write_config(auth='password = "inline-pass-123"')
     assert load_config(server.config, env={}).auth.password == "inline-pass-123"
@@ -142,7 +144,8 @@ def test_apply_is_atomic_and_keeps_backup(server, monkeypatch):
     from conftest import FAKE
     first = generate.apply(cfg, secret, paths, FAKE)
     assert first.changed and first.backup is None
-    assert oct(paths.current_json.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":   # Windows 没有 0600 语义
+        assert oct(paths.current_json.stat().st_mode & 0o777) == "0o600"
     again = generate.apply(cfg, secret, paths, FAKE)
     assert not again.changed and again.version == first.version  # 幂等
 
@@ -167,7 +170,8 @@ def test_cert_checks(server, tmp_path):
     c, k = server.state / "tls" / "self-signed.crt", server.state / "tls" / "self-signed.key"
     ok = cert.check(c, k, "example.test")
     assert ok.ok and ok.self_signed and ok.days_left >= 363
-    assert oct(k.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":   # Windows 没有 0600 语义
+        assert oct(k.stat().st_mode & 0o777) == "0o600"
     assert any("SAN" in e for e in cert.check(c, k, "other.test").errors)
     c2, k2 = tmp_path / "o.crt", tmp_path / "o.key"
     cert.self_signed("example.test", c2, k2)

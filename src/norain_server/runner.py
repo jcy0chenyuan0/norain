@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from norain_core import singbox
 from norain_core.errors import NorainError
+from norain_core.migrate import migration_warnings
 from norain_core.secrets import Secret
 from norain_core.supervisor import Listener, Spec, Supervisor, check_ports_free, record_error
 
@@ -23,6 +24,11 @@ class Prepared:
     binary: singbox.BinaryInfo
     cert: certmod.CertStatus
     applied: generate.ApplyResult | None
+
+    @property
+    def warnings(self) -> list[str]:
+        """本次预检要展示给调用方的全部 warning：配置迁移 + 证书检查。"""
+        return migration_warnings(self.cfg) + self.cert.warnings
 
 
 def listeners(cfg: ServerConfig) -> list[Listener]:
@@ -45,12 +51,20 @@ def need_tags(cfg: ServerConfig) -> set[str]:
     return tags
 
 
+def tls_alpn01_ready(cfg: ServerConfig) -> bool:
+    """TLS-ALPN-01 需要 443/tcp 上的 TLS 监听，目前只有 Trojan 能提供。"""
+    return cfg.protocols.trojan.enabled and cfg.protocols.trojan.port == 443
+
+
 def cert_status(cfg: ServerConfig, paths: Paths, *, tags: frozenset[str] | None = None,
-                service_running: bool = False) -> certmod.CertStatus:
+                service_running: bool = False,
+                tags_unknown: bool = False) -> certmod.CertStatus:
     """三种证书模式统一的检查入口。"""
     if cfg.tls.mode == "acme":
         return certmod.acme_status(cfg.server.domain, paths.acme_dir, tags=tags,
-                                   service_running=service_running)
+                                   tags_unknown=tags_unknown,
+                                   service_running=service_running,
+                                   tls_alpn01=tls_alpn01_ready(cfg))
     cert_path, key_path = generate.cert_paths(cfg, paths)
     return certmod.check(cert_path, key_path, cfg.server.domain)
 
@@ -83,7 +97,7 @@ def prepare(paths: Paths, *, apply: bool = True) -> Prepared:
     info = locate_singbox(paths)
     singbox.require(info, need_tags=need_tags(cfg))
     status = cert_status(cfg, paths, tags=info.tags, service_running=service_running(paths))
-    status.raise_if_invalid()
+    certmod.raise_for_mode(cfg.tls.mode, status)
     if cfg.tls.mode == "acme":
         paths.acme_dir.mkdir(parents=True, exist_ok=True)
     applied = generate.apply(cfg, secret, paths, info.path) if apply else None

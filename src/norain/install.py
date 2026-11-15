@@ -10,6 +10,7 @@ Python 包本身由包管理器安装（pip），卸载命令不删除它。本�
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -20,7 +21,7 @@ from norain_core.errors import NorainError
 from norain_core.log import Logger, new_op_id
 from norain_core.state import STOPPED, read_json, set_desired, write_json
 
-from . import block, boot, repair, rules
+from . import block, boot, defaults, repair, rules
 from .model import load_config
 from .paths import Paths
 
@@ -28,12 +29,44 @@ ENV_NAME = "norain"
 
 
 def _env(paths: Paths) -> dict[str, str]:
-    return {"NORAIN_HOME": str(paths.home), "NORAIN_CONFIG": str(paths.config)}
+    # Persist every path that may have been selected through the environment.
+    # Omitting NORAIN_STATE makes a custom state directory disappear in the next
+    # terminal, so the installed command starts against a different instance.
+    return {"NORAIN_HOME": str(paths.home), "NORAIN_CONFIG": str(paths.config),
+            "NORAIN_STATE": str(paths.state)}
+
+
+def _toml_list(items: list[str], *, width: int = 96) -> str:
+    """把名单排成多行 TOML 数组，避免生成出来的配置单行过长。"""
+    if not items:
+        return "[]"
+    lines, cur = [], ""
+    for item in items:
+        token = json.dumps(item, ensure_ascii=False) + ","
+        candidate = f"{cur} {token}".strip() if cur else token
+        if len("                " + candidate) > width:
+            lines.append(cur)
+            cur = token
+        else:
+            cur = candidate
+    lines.append(cur)
+    return "[" + ("\n                ".join(lines)) + "]"
 
 
 def default_config_text(paths: Paths, *, server: str, credential_ref: str, traffic_mode: str,
                         protocol: str) -> str:
+    def q(value: str) -> str:
+        # Environment variables and paths can contain quotes or backslashes.
+        # JSON basic-string escaping is valid TOML basic-string escaping.
+        return json.dumps(str(value), ensure_ascii=False)
+
+    white = _toml_list(defaults.PROXY_DOMAINS)
+    black = _toml_list(defaults.DIRECT_DOMAINS)
+    blue = _toml_list(defaults.ISOLATION_ALLOWLIST)
     return f"""# 由 norain install 生成。修改后运行 norain config validate 和 norain restart
+# 默认值取自本机 sing-box.json：混合入口 127.0.0.1:1082、国内直连其余走隧道、
+# 白名单是原来那组强制走代理的 domain_suffix（见 src/norain/defaults.py）。
+# 见 docs/decisions/0007。
 schema = 1
 
 [app]
@@ -42,13 +75,14 @@ auto_start = true
 
 [local]
 listen = "127.0.0.1"
-port = 2080
+port = 1082                # 沿用原来的系统代理端口
+probe_port = 1092          # 占用连续 3 个端口，不能和 port 重叠
 
 [proxy]
-protocol = "{protocol}"    # auto | hysteria2 | trojan
-server = "{server}"
-traffic_mode = "{traffic_mode}"   # tun：全局接管（需要管理员权限）；mixed：只有本地代理
-credential_ref = "{credential_ref}"
+protocol = {q(protocol)}    # auto | hysteria2 | trojan
+server = {q(server)}
+traffic_mode = {q(traffic_mode)}   # tun：全局接管（需要管理员权限）；system-proxy：只设系统代理；mixed：只有本地代理
+credential_ref = {q(credential_ref)}
 
 [proxy.hysteria2]
 port = 443
@@ -56,10 +90,17 @@ port = 443
 [proxy.trojan]
 port = 443
 
+[proxy.tls]
+server_name = "www.bing.com"   # 与服务端的伪装域名一致
+insecure = true                # 沿用原 sing-box.json 的 tls.insecure: true；配上真证书后改成 false
+
 [routing]
-proxy_domains = []         # 白名单：强制走代理
-direct_domains = []        # 黑名单：强制直连
-isolation_allowlist = []   # 蓝名单：阻断模式下仍允许的连接
+# 白名单：强制走代理。取自原来 sing-box.json 里 domain_suffix → proxy 的那一组
+proxy_domains = {white}
+# 黑名单：强制直连。原配置没有显式条目，国内直连由 routing.rule_set 承担
+direct_domains = {black}
+# 蓝名单：阻断模式下仍允许的连接。取自原来杀开关的 $allowSites
+isolation_allowlist = {blue}
 
 [dns]
 mode = "split"
@@ -68,7 +109,8 @@ mode = "split"
 
 def install(paths: Paths, *, archive: Path | None = None, sha256: str | None = None,
             singbox_path: Path | None = None, config_src: Path | None = None, server: str = "",
-            traffic_mode: str = "tun", protocol: str = "auto", force: bool = False, start: bool = True,
+            traffic_mode: str = "system-proxy", protocol: str = "auto", force: bool = False,
+            start: bool = True,
             log: Logger | None = None, env=None) -> dict:
     env = os.environ if env is None else env
     steps: list[str] = []
@@ -185,36 +227,51 @@ def clear_system_proxy(paths: Paths) -> str | None:
     return None
 
 
-def stop_everything(paths: Paths) -> list[str]:
-    """停止内控制进程和看门狗。先写期望状态，保证任何保活方都不会再拉起。"""
+def stop_everything(paths: Paths) -> tuple[list[str], list[str]]:
+    """停止内控制进程和看门狗。先写期望状态，保证任何保活方都不会再拉起。
+
+    返回 (已做成的事, 出错的事)：卸载必须区分「停下来了」和「停不下来」，
+    否则后面的删目录会把还在运行的进程变成孤儿。
+    """
     from . import maintain, runner
-    done = []
+    done: list[str] = []
+    errors: list[str] = []
     set_desired(paths.desired, STOPPED, op_id=new_op_id())
     try:
         runner.backend(paths).stop()
         done.append("已停止代理")
-    except NorainError as e:
-        done.append(f"停止代理时出错：{e.message}")
-    if maintain.kill_watchdog(paths):
-        done.append("已停止看门狗")
-    return done
+    except (NorainError, OSError) as e:
+        errors.append(f"没有停下代理：{getattr(e, 'message', str(e))}")
+    try:
+        if maintain.kill_watchdog(paths):
+            done.append("已停止看门狗")
+    except OSError as e:
+        errors.append(f"没有停下看门狗：{e}")
+    return done, errors
 
 
 def uninstall(paths: Paths, *, log: Logger | None = None) -> dict:
     """完全卸载：清除注册表 / 计划任务 / 环境变量 / 防火墙规则 / 全部文件。"""
     done: list[str] = []
     errors: list[str] = []
+    clean = True
     if paths.state.exists():
-        done += stop_everything(paths)
+        d, e = stop_everything(paths)
+        done += d
+        errors += e
+        clean = clean and not e
     try:
         if block.release(paths)["was_active"]:
             done.append("已解除阻断")
-    except NorainError as e:
-        errors.append(f"{e.message}（{e.hint}）")
+    except (NorainError, OSError) as e:
+        errors.append(f"{getattr(e, 'message', str(e))}"
+                      + (f"（{e.hint}）" if isinstance(e, NorainError) and e.hint else ""))
+        clean = False
     try:
         done += boot.unregister()
-    except NorainError as e:
-        errors.append(e.message)
+    except (NorainError, OSError) as e:
+        errors.append(getattr(e, "message", str(e)))
+        clean = False
     msg = clear_system_proxy(paths)
     if msg:
         done.append(msg)
@@ -222,10 +279,17 @@ def uninstall(paths: Paths, *, log: Logger | None = None) -> dict:
     bin_dir = Path(record.get("bin_dir") or paths.bin_dir)
     try:
         done += osutil.unpersist_env(list(_env(paths)), system=False, name=ENV_NAME, path_dirs=(str(bin_dir),))
-    except NorainError as e:
-        errors.append(e.message)
+    except (NorainError, OSError) as e:
+        errors.append(getattr(e, "message", str(e)))
+        clean = False
     osutil.remove_launcher(bin_dir, "norain")
-    for d in (paths.state, paths.log_dir, paths.home):
+    targets = [paths.state, paths.log_dir, paths.home] if clean else []
+    if not clean:
+        # 保留状态、配置和日志：否则防火墙规则还在或进程仍在运行时，
+        # 用户卸载完无法安全恢复。
+        errors.append(f"阻断规则或代理进程没有清理干净，保留状态目录 {paths.state}；"
+                      "同时保留配置和日志，处理权限问题后重新运行 norain uninstall")
+    for d in targets:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
             if d.exists():

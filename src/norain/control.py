@@ -519,10 +519,12 @@ class Controller:
         with self._op:
             self.phase = BOOT   # 重建期间抑制自维持
             try:
+                # 先生成并运行 sing-box check。候选配置无效时保持旧模块完整运行，
+                # 不要先停掉代理再把错误留给 finally 处理。
+                generate.apply(new.cfg, new.secret, new.paths, new.binary.path)
                 for name in ("maintain", "monitor", "routing", "proxy"):
                     self.modules[name].stop()
                 self.prep, self.cfg, self.paths = new, new.cfg, new.paths
-                generate.apply(self.cfg, self.prep.secret, self.paths, self.prep.binary.path)
                 self._build_modules()
                 for name in ("routing", "proxy"):
                     self.modules[name].start()

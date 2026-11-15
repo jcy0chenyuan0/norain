@@ -7,6 +7,7 @@ Windows 与 Linux 的差异都收在这里，上层模块不直接拼系统命�
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -122,7 +123,7 @@ def _profile_file(name: str, system: bool) -> Path:
     return Path.home() / ".config" / name / "env.sh"
 
 
-_PROFILE_HOOK = "# norain-env:{name}\n[ -f \"{path}\" ] && . \"{path}\"\n"
+_PROFILE_HOOK = "# norain-env:{name}\n[ -f {path} ] && . {path}\n"
 
 
 def persist_env(variables: dict[str, str], *, system: bool, name: str,
@@ -154,9 +155,10 @@ def persist_env(variables: dict[str, str], *, system: bool, name: str,
             _win_broadcast_env()
         return done
     lines = [f"# 由 {name} 生成，卸载时删除"]
-    lines += [f"export {k}='{v}'" for k, v in variables.items()]
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in variables.items()]
     for d in path_dirs:
-        lines.append(f'case ":$PATH:" in *":{d}:"*) ;; *) export PATH="$PATH:{d}" ;; esac')
+        quoted = shlex.quote(d)
+        lines.append(f'case ":$PATH:" in *":{quoted}:"*) ;; *) export PATH="$PATH":{quoted} ;; esac')
     f = _profile_file(name, system)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -164,7 +166,8 @@ def persist_env(variables: dict[str, str], *, system: bool, name: str,
     done.append(f"写入 {f}")
     if not system:
         profile = Path.home() / ".profile"
-        hook = _PROFILE_HOOK.format(name=name, path=f)
+        quoted = shlex.quote(str(f))
+        hook = _PROFILE_HOOK.format(name=name, path=quoted)
         text = profile.read_text(encoding="utf-8") if profile.exists() else ""
         if f"# norain-env:{name}" not in text:
             profile.write_text(text + ("" if text.endswith("\n") or not text else "\n") + hook,

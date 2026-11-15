@@ -11,6 +11,7 @@ Windows：sing-box.exe 装到 %ProgramFiles%\\norain-server，配置在 %Program
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 from norain_core import fetch, osutil, singbox
-from norain_core.errors import EXIT_CONFLICT, EXIT_EXTERNAL, NorainError
+from norain_core.errors import EXIT_CONFIG, EXIT_CONFLICT, EXIT_EXTERNAL, NorainError
 from norain_core.log import new_op_id
 from norain_core.secrets import generate_to_file
 from norain_core.state import RUNNING, STOPPED, get_desired, read_json, set_desired, write_json
@@ -84,20 +85,36 @@ def default_config_text(paths: Paths, env, *, secret_ref: str) -> str:
     NORAIN_CERT_MODE 在安装时写进文件，之后不依赖这些环境变量仍然存在。"""
     domain = (env.get("NORAIN_DOMAIN") or "").strip() or socket.gethostname()
     mode = (env.get("NORAIN_CERT_MODE") or "").strip() or "self-signed"
-    hy2 = int(env.get("NORAIN_HY2_PORT") or 443)
+    def port_env(name: str, default: int) -> int:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise NorainError(f"环境变量 {name} 必须是整数", exit_code=EXIT_CONFIG, module="deploy") from None
+
+    hy2 = port_env("NORAIN_HY2_PORT", 443)
     trojan_port = env.get("NORAIN_TROJAN_PORT")
+    trojan = port_env("NORAIN_TROJAN_PORT", 443) if trojan_port else 443
+    def q(value: str) -> str:
+        # JSON basic-string escaping is also valid TOML basic-string escaping.
+        # Values come from environment variables and paths, so interpolating them
+        # directly would make quotes, backslashes, or newlines corrupt the file.
+        return json.dumps(str(value), ensure_ascii=False)
+
     lines = [
         "# 由 norain-server install 生成。修改后运行 norain-server config validate 和 norain-server restart",
         "schema = 1", "",
-        "[server]", f'domain = "{domain}"', 'listen = "::"', "",
+        "[server]", f"domain = {q(domain)}", 'listen = "::"', "",
         "[protocols.hysteria2]", "enabled = true", f"port = {hy2}", "",
         "[protocols.trojan]", f"enabled = {'true' if trojan_port else 'false'}",
-        f"port = {int(trojan_port) if trojan_port else 443}", "",
-        "[auth]", f'credential_ref = "{secret_ref}"', "",
-        "[tls]", f'mode = "{mode}"',
+        f"port = {trojan}", "",
+        "[auth]", f"credential_ref = {q(secret_ref)}", "",
+        "[tls]", f"mode = {q(mode)}",
     ]
     if mode == "acme" and env.get("NORAIN_ACME_EMAIL"):
-        lines.append(f'email = "{env["NORAIN_ACME_EMAIL"]}"')
+        lines.append(f"email = {q(env['NORAIN_ACME_EMAIL'])}")
     lines += ["", "[service]", "check_interval_seconds = 30", "restart_limit = 3",
               "restart_backoff_seconds = 2", "",
               "[logging]", 'directory = ""', 'level = "info"', "max_size_mb = 20", "retain_files = 5", ""]
@@ -253,12 +270,18 @@ def install(paths: Paths, *, force: bool = False, archive: Path | None = None,
         secret_file = paths.secrets_dir / "password"
         injected = (env.get("NORAIN_PASSWORD") or "").strip()
         if injected and (force or not secret_file.exists()):
+            old = secret_file.read_bytes() if secret_file.exists() else None
             fd = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(injected + "\n")
+            if old is None:
+                undo.append(lambda: secret_file.unlink(missing_ok=True))
+            else:   # --force 覆盖了已有密码：失败时还原
+                undo.append(lambda old=old: (secret_file.write_bytes(old), os.chmod(secret_file, 0o600)))
             steps.append("密码取自 NORAIN_PASSWORD，已写入密码文件")
         elif not secret_file.exists():
             generate_to_file(secret_file)
+            undo.append(lambda: secret_file.unlink(missing_ok=True))
             steps.append(f"已生成随机密码：{secret_file}")
 
         # 4. 配置：已有的用户配置不覆盖，除非 --force（覆盖前备份）
@@ -268,11 +291,13 @@ def install(paths: Paths, *, force: bool = False, archive: Path | None = None,
             if paths.config.exists():
                 bak = paths.config.with_name(f"{paths.config.name}.{time.strftime('%Y%m%dT%H%M%S')}.bak")
                 shutil.copy2(paths.config, bak)
+                undo.append(lambda bak=bak: shutil.copy2(bak, paths.config))   # --force 失败时还原旧配置
                 steps.append(f"已备份旧配置到 {bak}")
             else:
                 undo.append(lambda: paths.config.unlink(missing_ok=True))
-            paths.config.write_text(default_config_text(paths, env, secret_ref=f"file:{secret_file}"),
-                                    encoding="utf-8")
+            paths.config.write_text(
+                default_config_text(paths, env, secret_ref=f"file:{secret_file.as_posix()}"),
+                encoding="utf-8")
             os.chmod(paths.config, 0o640)
             steps.append(f"已写入默认配置 {paths.config}")
 
@@ -418,19 +443,26 @@ def uninstall(paths: Paths, *, purge: bool = False) -> dict:
     osutil.require_admin("卸载服务端", module="deploy")
     done: list[str] = []
     errors: list[str] = []
+    clean_state = True
     try:
         set_desired(paths.desired, STOPPED, op_id=new_op_id())
         pick_backend(paths).stop()
         done.append("已停止服务")
     except (NorainError, OSError) as e:
         errors.append(f"停止服务：{e}")
-    done += unregister_autostart()
+        clean_state = False
+    try:
+        done += unregister_autostart()
+    except (NorainError, OSError) as e:
+        errors.append(f"清理自启动项：{e}")
+        clean_state = False
     try:
         fw = firewall.close_ports(paths)
         if fw.get("closed"):
             done.append("已移除防火墙规则：" + "、".join(fw["closed"]))
     except NorainError as e:
         errors.append(e.message)
+        clean_state = False
     record = read_json(paths.install_record) or {}
     launcher_dir = paths.install_dir
     try:
@@ -438,19 +470,28 @@ def uninstall(paths: Paths, *, purge: bool = False) -> dict:
                                      path_dirs=(str(launcher_dir),) if osutil.IS_WINDOWS else ())
     except NorainError as e:
         errors.append(e.message)
+        clean_state = False
     if osutil.remove_launcher(launcher_dir, "norain-server"):
         done.append("已删除启动器")
-    if record.get("singbox_installed_by_norain", True) and paths.default_singbox.is_file():
+    # 只有确认是 Norain 装的才删：安装记录缺失时不能假定这个二进制属于我们
+    if record.get("singbox_installed_by_norain") is True and paths.default_singbox.is_file():
         paths.default_singbox.unlink(missing_ok=True)
         done.append(f"已删除 {paths.default_singbox}")
     if osutil.IS_WINDOWS and launcher_dir.is_dir() and not any(launcher_dir.iterdir()):
         launcher_dir.rmdir()
     (paths.home / "env").unlink(missing_ok=True)
-    if paths.state.exists():
+    if clean_state and paths.state.exists():
         shutil.rmtree(paths.state, ignore_errors=True)
-        done.append(f"已删除状态目录 {paths.state}")
+        if paths.state.exists():
+            errors.append(f"删除状态目录失败：{paths.state}")
+            clean_state = False
+        else:
+            done.append(f"已删除状态目录 {paths.state}")
+    elif paths.state.exists():
+        errors.append(f"服务、启动项、防火墙或环境变量未清理干净，保留状态目录 {paths.state}；"
+                     "处理上面的错误后重新运行 uninstall")
     kept = []
-    if purge:
+    if purge and clean_state:
         for d in (paths.home, paths.log_dir):
             if d.exists():
                 shutil.rmtree(d, ignore_errors=True)
@@ -458,6 +499,9 @@ def uninstall(paths: Paths, *, purge: bool = False) -> dict:
         if os.name == "posix" and _service_ids() is not None:
             osutil.run(["userdel", SERVICE_USER])
             done.append(f"已删除用户 {SERVICE_USER}")
+    elif purge and not clean_state:
+        errors.append("因为前面的清理失败，保留配置和日志；处理错误后重新运行 uninstall --purge")
+        kept = [str(d) for d in (paths.home, paths.log_dir) if d.exists()]
     else:
         kept = [str(d) for d in (paths.home, paths.log_dir) if d.exists()]
     return {"done": done, "kept": kept, "errors": errors}

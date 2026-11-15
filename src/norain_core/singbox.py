@@ -47,7 +47,10 @@ def locate(explicit: str | None = None, *, defaults: tuple[str, ...] = (DEFAULT_
 
 def _run(args: list[str], *, timeout: float) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        # 显式 UTF-8：Windows 上 locale 是 GBK，按 GBK 解码会抛 UnicodeDecodeError，
+        # 读线程一崩 stdout/stderr 就变成 None，后面的判断全部失效。
+        return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         raise NorainError(f"{args[0]} {args[1]} 超时（{timeout:.0f} 秒）", exit_code=EXIT_TIMEOUT,
                           module="singbox", retryable=True) from None

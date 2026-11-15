@@ -1,4 +1,8 @@
-"""server.toml 配置模型和字段级校验。映射规则见 docs/decisions/0004。"""
+"""server.toml 配置模型和字段级校验。映射规则见 docs/decisions/0004。
+
+加载顺序是「迁移 → 环境变量覆盖 → 字段校验 → 交叉校验」：Schema 版本策略和
+逐级迁移在 ``norain_core.migrate``，本模块只取结果；迁移产生的 warning 挂在
+配置对象上，由 ``migration_warnings`` 读取（服务端没有额外的取值提醒）。"""
 
 from __future__ import annotations
 
@@ -9,13 +13,13 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator
 
 from norain_core.errors import BIZ_CONFIG, EXIT_CONFIG, FieldError, NorainError, config_error
+from norain_core.migrate import SCHEMA_VERSION, attach_warnings, migrate
 from norain_core.redact import REDACTOR
 from norain_core.secrets import check_private_file
 
-SCHEMA_VERSION = 1
 Port = Field(ge=1, le=65535)
 
 
@@ -85,6 +89,7 @@ class Logging(_Strict):
 
 
 class ServerConfig(_Strict):
+    _config_warnings: list[str] = PrivateAttr(default_factory=list)
     schema_version: int = Field(SCHEMA_VERSION, alias="schema")
     server: Server = Server()
     protocols: Protocols = Protocols()
@@ -100,6 +105,9 @@ _ENV_OVERRIDES = {
     "NORAIN_TROJAN_PORT": ("protocols", "trojan", "port", int),
     "NORAIN_CERT_MODE": ("tls", "mode", str),
     "NORAIN_ACME_EMAIL": ("tls", "email", str),
+    # 密码本身不写进模型，改成 credential_ref，避免 status / 日志把环境变量
+    # 内容当成配置里的明文密码，同时保证环境变量优先于 TOML 中的旧来源。
+    "NORAIN_PASSWORD": ("auth", "credential_ref", str),
 }
 
 _TYPE_MESSAGES = {
@@ -153,7 +161,7 @@ def _apply_env(data: dict, env, errors: list[FieldError]) -> list[str]:
         if raw is None or raw == "":
             continue
         try:
-            value = cast(raw)
+            value = (f"env:{var}" if var == "NORAIN_PASSWORD" else cast(raw))
         except ValueError:
             errors.append(FieldError(f"环境变量 {var}", "必须是整数"))
             continue
@@ -164,6 +172,10 @@ def _apply_env(data: dict, env, errors: list[FieldError]) -> list[str]:
                 break
             node = nxt
         else:
+            if var == "NORAIN_PASSWORD":
+                # 环境变量优先于 TOML，不能让旧的 auth.password 与新的来源
+                # 同时存在，也不能保留一个会被 credential_ref 覆盖的旧文件引用。
+                node.pop("password", None)
             node[leaf] = value
             applied.append(var)
     return applied
@@ -174,8 +186,6 @@ def _cross_checks(cfg: ServerConfig) -> list[FieldError]:
     p = cfg.protocols
     if not (p.hysteria2.enabled or p.trojan.enabled):
         errs.append(FieldError("protocols", "至少要启用 hysteria2 或 trojan 中的一个"))
-    if cfg.schema_version != SCHEMA_VERSION:
-        errs.append(FieldError("schema", f"不支持的配置版本 {cfg.schema_version}，本程序支持 {SCHEMA_VERSION}"))
     if not cfg.server.domain.strip():
         errs.append(FieldError("server.domain", "不能为空（证书的域名或 IP）"))
     if cfg.auth.password and cfg.auth.credential_ref:
@@ -215,12 +225,16 @@ def load_config(path: Path, env=None) -> ServerConfig:
     except tomllib.TOMLDecodeError as e:
         raise config_error([FieldError("(TOML 语法)", str(e))]) from None
 
+    migration = migrate(data, current=SCHEMA_VERSION, source=str(path))
     errors: list[FieldError] = []
-    _apply_env(data, env, errors)
+    _apply_env(migration.data, env, errors)
     try:
-        cfg = ServerConfig.model_validate(data)
+        cfg = ServerConfig.model_validate(migration.data)
     except ValidationError as e:
         raise config_error(errors + [_translate(x) for x in e.errors()]) from None
+    attach_warnings(cfg, migration)
+    if not cfg.auth.password and not cfg.auth.credential_ref and not env.get("NORAIN_PASSWORD"):
+        errors.append(FieldError("auth.credential_ref", "不能为空（使用 file:<路径>、env:<变量名> 或 NORAIN_PASSWORD）"))
     errors += _cross_checks(cfg)
     if cfg.auth.password:
         REDACTOR.register(cfg.auth.password)

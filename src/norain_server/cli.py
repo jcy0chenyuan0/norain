@@ -15,17 +15,17 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
 
 from norain_core import apply as core_apply
 from norain_core import atomic, cliutil, osutil, singbox
-from norain_core.errors import (BIZ_BINARY_MISSING, BIZ_OK, BIZ_PROCESS_EXITED, BIZ_RESTART_LIMIT,
-                                EXIT_CONFIG, EXIT_DEPENDENCY, EXIT_FAILURE, EXIT_OK, NorainError)
+from norain_core.errors import (BIZ_BINARY_MISSING, BIZ_CERT, BIZ_OK, BIZ_PROCESS_EXITED,
+                                BIZ_RESTART_LIMIT, EXIT_CONFIG, EXIT_DEPENDENCY, EXIT_FAILURE,
+                                EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, NorainError)
 from norain_core.log import new_op_id
-from norain_core.redact import redact
+from norain_core.migrate import migration_warnings
 from norain_core.secrets import generate_to_file
 from norain_core.state import RUNNING, STOPPED, get_desired, op_lock, read_json, set_desired
 
@@ -45,7 +45,7 @@ def cmd_config_validate(args, paths: Paths) -> int:
     # 生成候选并跑 sing-box check，但不替换当前配置
     data = generate.render(prep.cfg, prep.secret, prep.paths)
     core_apply.check_only(data, prep.paths.run_dir, prep.binary.path)
-    warnings = prep.cert.warnings
+    warnings = prep.warnings
     _out(args, {"config": str(paths.config), "config_version": generate.version_of(data),
                 "singbox_version": prep.binary.version, "warnings": warnings},
          "配置有效（已通过 sing-box check）" + "".join(f"\n警告：{w}" for w in warnings))
@@ -114,14 +114,16 @@ def cmd_config_edit(args, paths: Paths) -> int:
 def cmd_cert_check(args, paths: Paths) -> int:
     cfg = load_config(paths.config)
     tags = None
+    tags_unknown = False
     if cfg.tls.mode == "acme":
         try:
             tags = runner.locate_singbox(paths).tags
         except NorainError:
-            pass
-    st = runner.cert_status(cfg, paths, tags=tags, service_running=runner.service_running(paths))
+            tags_unknown = True    # 二进制不可验证时，ACME 不能报「前置条件通过」
+    st = runner.cert_status(cfg, paths, tags=tags, service_running=runner.service_running(paths),
+                            tags_unknown=tags_unknown)
     if not st.ok:
-        st.raise_if_invalid()
+        certmod.raise_for_mode(cfg.tls.mode, st)
     if st.days_left is None:
         text = f"证书模式 {cfg.tls.mode}：前置条件检查通过，证书尚未签发"
     else:
@@ -132,8 +134,13 @@ def cmd_cert_check(args, paths: Paths) -> int:
 
 
 def cmd_cert_self_signed(args, paths: Paths) -> int:
+    if args.days <= 0:
+        raise NorainError("--days 必须是正整数", exit_code=EXIT_USAGE, module="cert")
     c, k = paths.tls_dir / "self-signed.crt", paths.tls_dir / "self-signed.key"
     st, method = certmod.self_signed(args.domain, c, k, days=args.days, force=args.force)
+    if not st.ok:
+        raise NorainError("生成的证书无效：" + "；".join(st.errors), exit_code=EXIT_CONFIG,
+                          business_code=BIZ_CERT, module="cert")
     _out(args, {"cert": st.as_dict(), "method": method},
          f"已生成自签证书（{method}）：\n  证书：{c}\n  私钥：{k}\n"
          f"  SHA-256 指纹：{st.fingerprint_sha256}\n"
@@ -160,7 +167,12 @@ def cmd_start(args, paths: Paths) -> int:
         runner.prepare(paths, apply=False)  # 先在前台报出配置和证书问题
         set_desired(paths.desired, RUNNING, op_id=op_id)
         backend = pick_backend(paths)
-        backend.start()
+        try:
+            backend.start()
+        except NorainError as e:
+            if e.exit_code == EXIT_TIMEOUT:   # 超时已把守护进程停掉，别再留 running
+                set_desired(paths.desired, STOPPED, op_id=op_id)
+            raise
     _out(args, {"state": "running", "backend": backend.name, "op_id": op_id}, "已启动")
     return EXIT_OK
 
@@ -203,10 +215,11 @@ def cmd_reload(args, paths: Paths) -> int:
                 paths.reload_file.unlink(missing_ok=True)
                 raise NorainError("守护进程没有响应重载请求", exit_code=6, module="daemon", retryable=True,
                                   hint="运行 norain-server restart")
+    warnings = prep.warnings
     _out(args, {"reloaded": running, "config_version": prep.applied.version,
-                "config_changed": prep.applied.changed, "warnings": prep.cert.warnings, "op_id": op_id},
+                "config_changed": prep.applied.changed, "warnings": warnings, "op_id": op_id},
          ("已重载" if running else "服务没有运行，只更新了配置文件")
-         + "".join(f"\n警告：{w}" for w in prep.cert.warnings))
+         + "".join(f"\n警告：{w}" for w in warnings))
     return EXIT_OK
 
 
@@ -290,14 +303,21 @@ def build_status(paths: Paths) -> dict:
             {"name": n, "port": p.port, "transport": t}
             for n, p, t in (("hysteria2", cfg.protocols.hysteria2, "udp"),
                             ("trojan", cfg.protocols.trojan, "tcp")) if p.enabled]
-        status["config"] = {"valid": True}
+        status["config"] = {"valid": True, "warnings": migration_warnings(cfg)}
     except NorainError as e:
         business = e.business_code
         status["config"] = {"valid": False, "errors": [f.as_dict() for f in e.field_errors] or e.message}
         status["protocols"] = []
 
     if cfg is not None:
-        st = runner.cert_status(cfg, paths, service_running=True)
+        tags, tags_unknown = None, False
+        if cfg.tls.mode == "acme":
+            try:
+                tags = runner.locate_singbox(paths).tags
+            except NorainError:
+                tags_unknown = True
+        st = runner.cert_status(cfg, paths, tags=tags, service_running=True,
+                                tags_unknown=tags_unknown)
         status["cert"] = {"ok": st.ok, "mode": cfg.tls.mode, "not_after": st.not_after,
                           "days_left": st.days_left, "self_signed": st.self_signed,
                           "errors": st.errors, "warnings": st.warnings}

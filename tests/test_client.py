@@ -21,10 +21,12 @@ from conftest import FAKE, PASSWORD, ROOT, free_port
 class Client:
     def __init__(self, tmp: Path):
         self.tmp, self.home, self.state = tmp, tmp / "cfg", tmp / "state"
-        self.home.mkdir(); self.state.mkdir()
+        self.home.mkdir()
+        self.state.mkdir()
         self.config = self.home / "cfg.toml"
         self.secret = self.home / "password"
-        self.secret.write_text(PASSWORD + "\n"); self.secret.chmod(0o600)
+        self.secret.write_text(PASSWORD + "\n")
+        self.secret.chmod(0o600)
         self.port = free_port()
         self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("NORAIN_", "FAKE_SB_"))},
                     "NORAIN_HOME": str(self.home), "NORAIN_STATE": str(self.state),
@@ -53,7 +55,7 @@ port = {self.port}
 [proxy]
 protocol = "{protocol}"
 server = "example.test"
-credential_ref = "file:{self.secret}"
+credential_ref = "file:{self.secret.as_posix()}"
 {proxy_extra}
 [proxy.trojan]
 port = 8443
@@ -155,6 +157,7 @@ def test_field_errors(client):
     assert "proxy.server" in errs(client)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="断言的是 POSIX 路径字符串，Windows 上 Path 会渲染成反斜杠")
 def test_paths_per_platform():
     win = Paths.from_env({"APPDATA": r"C:\Users\u\AppData\Roaming",
                           "LOCALAPPDATA": r"C:\Users\u\AppData\Local"}, platform="nt")
@@ -174,14 +177,16 @@ def test_lifecycle_chain(client):
     assert str(client.port) in r.stdout
     st = client.status()
     assert st["service"]["state"] == "running" and st["process"]["running"] and st["business_code"] == 0
-    assert st["proxy"] == {"protocol": "hysteria2", "server": "example.test", "port": 443,
-                           "traffic_mode": "mixed"}
+    # status 可能多带 active_protocol 之类的运行时字段，只断言关心的键
+    assert {k: st["proxy"][k] for k in ("protocol", "server", "port", "traffic_mode")} == {
+        "protocol": "hysteria2", "server": "example.test", "port": 443, "traffic_mode": "mixed"}
     with socket.create_connection(("127.0.0.1", client.port), timeout=3):
         pass
     assert "运行中" in client.cli("status").stdout
     out = client.cli("config", "show").stdout + json.dumps(st) + client.cli("logs").stdout
     assert PASSWORD not in out
-    assert oct((client.state / "run" / "sing-box.json").stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":   # Windows 没有 0600 语义
+        assert oct((client.state / "run" / "sing-box.json").stat().st_mode & 0o777) == "0o600"
 
     assert client.cli("stop").returncode == 0
     time.sleep(2.5)
@@ -206,7 +211,8 @@ def test_stop_via_stop_file_only(client):
 
 def test_port_conflict_and_restart_limit(client):
     with socket.socket() as s:
-        s.bind(("127.0.0.1", client.port)); s.listen()
+        s.bind(("127.0.0.1", client.port))
+        s.listen()
         r = client.cli("start", "--json")
         assert json.loads(r.stdout)["business_code"] == 130
     client.write(limit=1)

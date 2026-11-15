@@ -63,3 +63,12 @@
 4. 查不到时交给服务器解析并走代理（即默认走代理）。
 
 实现约束（硬性）：sing-box 1.12 起已移除内置 GeoIP 数据库，GeoIP 判断要用 rule-set 实现（ADR 0008）。「试连后改判并自动加入白名单」是 sing-box 做不到的动态行为，需要由 Norain 的内控制模块在 sing-box 之外实现，v0.4 开始前补一份设计。上文「GeoIP 不能单独决定分流」「不支持自动改判」的限制作废。
+
+2026-11-15，用户：**默认的三类名单按本机现在装载的那套代理来设**。
+
+- 白名单取本机 proxy-suite 的 sing-box.json 里 domain_suffix → proxy 的 87 条（OpenAI / Claude / Google / GitHub / 维基 等），
+  黑名单为空（原配置没有显式直连域名，国内直连由 geosite-cn + geoip-cn 规则集承担），
+  蓝名单取 network-guard.ps1 的 $allowSites（阻断期间仍放行 DeepSeek / B 站 / 知乎）。
+- 落点：src/norain/defaults.py（唯一来源），由 install 模板、模型缺省值和 examples/cfg.toml 共同引用。
+- 名单之外顺带对齐的机制：ip_is_private → direct、sniff、geosite-cn → 直连、DNS split（223.5.5.5 / 1.1.1.1 DoH 经代理）、
+  trojan 多路复用（smux / 8 条流，取自原配置）。

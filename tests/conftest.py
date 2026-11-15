@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-FAKE = ROOT / "tests" / "fakes" / "sing-box"
+# Windows 不能直接启动带 shebang 的脚本，用 .cmd 转发到同一个假二进制
+FAKE = ROOT / "tests" / "fakes" / ("sing-box.cmd" if os.name == "nt" else "sing-box")
 PASSWORD = "s3cr3t-Pa55w0rd-for-tests"
 
 
@@ -43,7 +44,9 @@ class Env:
 
     def write_config(self, *, trojan=True, extra="", tls_mode="self-signed", interval=1,
                      limit=3, auth=None):
-        auth = auth if auth is not None else f'credential_ref = "file:{self.secret}"'
+        # 写进 TOML 基本字符串的路径要用正斜杠：Windows 的 C:\Users\… 里 \U 会被
+        # 当成 unicode 转义，tomllib 直接报 Invalid hex value
+        auth = auth if auth is not None else f'credential_ref = "file:{self.secret.as_posix()}"'
         self.config.write_text(f"""
 schema = 1
 [server]

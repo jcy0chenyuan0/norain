@@ -1,7 +1,6 @@
 import json
 import os
 import tomllib
-from pathlib import Path
 
 import pytest
 
@@ -63,7 +62,7 @@ def test_desired_state_and_lock(tmp_path):
 
 
 def test_pinned_version_matches_lockfile():
-    lock = tomllib.loads((ROOT / "third_party" / "singbox.lock.toml").read_text())
+    lock = tomllib.loads((ROOT / "third_party" / "singbox.lock.toml").read_text(encoding="utf-8"))
     assert lock["singbox"]["version"] == singbox.PINNED_VERSION
 
 

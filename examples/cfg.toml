@@ -9,13 +9,13 @@ auto_start = true
 
 [local]
 listen = "127.0.0.1"          # 本地代理地址（HTTP 和 SOCKS5 共用一个端口）
-port = 2080
-probe_port = 2090             # 监控 / 分流 / 选协议用的本地探测入口，占用连续 3 个端口
+port = 1082                   # 与原来本机的系统代理端口一致
+probe_port = 1092             # 监控 / 分流 / 选协议用的本地探测入口，占用连续 3 个端口
 
 [proxy]
 protocol = "auto"             # auto（按测速和连通性自适应）| hysteria2 | trojan
 server = "example.com"        # 代理服务器域名或 IP
-traffic_mode = "tun"          # tun：全局接管（需要管理员权限）| mixed：只有本地代理 | system-proxy
+traffic_mode = "system-proxy"  # tun：全局接管（需要管理员权限）| mixed：只有本地代理 | system-proxy
 # 密码三选一：
 #   credential_ref = "file:<密码文件路径>"   文件第一行是密码
 #   credential_ref = "env:NORAIN_PASSWORD"
@@ -27,11 +27,16 @@ port = 443
 
 [proxy.trojan]
 port = 443
+# 多路复用：与原来那套代理一致（smux / 8 条流）。hysteria2 不需要也不能配这个。
+[proxy.trojan.multiplex]
+enabled = true
+protocol = "smux"             # smux | yamux | h2mux
+max_streams = 8
 
 [proxy.tls]
-server_name = ""              # 留空则使用 proxy.server
+server_name = "www.bing.com"  # 与服务端的伪装域名一致；留空则使用 proxy.server
 certificate_path = ""         # 服务端用自签证书时，填从服务器拷贝来的证书文件路径
-insecure = false              # true 会跳过证书校验，不安全
+insecure = true               # 沿用原 sing-box.json 的 tls.insecure: true；配上真证书后改成 false
 
 [proxy.selection]             # 只在 protocol = "auto" 时使用
 interval_seconds = 60         # 测速间隔
@@ -48,9 +53,41 @@ mtu = 9000
 strict_route = true
 
 [routing]
-proxy_domains = []            # 白名单：强制走代理，DNS 由服务器侧解析
-direct_domains = []           # 黑名单：强制直连，DNS 用国内服务器
-isolation_allowlist = []      # 蓝名单：阻断模式下仍允许的连接（域名、IP 或 CIDR）
+# 白名单：强制走代理，DNS 由服务器侧解析。默认取自本机现在这套代理
+# （C:\Users\j\proxy-suite\sing-box.json 里 domain_suffix → proxy 的那一组，
+#  87 条，换代理环境后按需增删）。父域已含子域，写 google.com 就不必再写
+# gemini.google.com；命中黑名单的条目优先于白名单？不——两者重复会直接报错。
+proxy_domains = [
+                 'openai.com', 'chatgpt.com', 'chatgpt.livekit.cloud', 'oaistatic.com',
+                 'oaiusercontent.com', 'openai.org', 'sora.com', 'openaiapi-site.azureedge.net',
+                 'identrust.com', 'statsig.com', 'featuregates.org', 'intercom.io',
+                 'browser-intake-datadoghq.com', 'claude.com', 'claude.ai', 'anthropic.com',
+                 'anthropic.ai', 'claudeusercontent.com', 'cla.st', 'usefathom.com', 'x.com',
+                 'twitter.com', 'twimg.com', 't.co', 'ads-twitter.com', 'twitterinc.com',
+                 'gemini.google.com', 'google.com', 'googleapis.com', 'gstatic.com',
+                 'googleusercontent.com', 'googlevideo.com', 'gvt1.com', 'gvt2.com',
+                 'withgoogle.com', 'google-analytics.com', 'googletagmanager.com',
+                 'youtube.com', 'youtu.be', 'ytimg.com', 'youtube-nocookie.com', 'ggpht.com',
+                 'wikipedia.org', 'wikimedia.org', 'wikidata.org', 'mediawiki.org',
+                 'wikimediafoundation.org', 'wiktionary.org', 'wikisource.org', 'wikibooks.org',
+                 'wikiquote.org', 'wikinews.org', 'wikivoyage.org', 'wikiversity.org',
+                 'github.com', 'githubusercontent.com', 'githubassets.com', 'github.io',
+                 'ghcr.io', 'github-cloud.s3.amazonaws.com', 'npmjs.org', 'npmjs.com',
+                 'pypi.org', 'pythonhosted.org', 'docker.com', 'docker.io', 'dockerhub.com',
+                 'huggingface.co', 'huggingface.com', 'hf.co', 'hf.space', 'anthropic.org',
+                 'claude.dev', 'sentry.io', 'statsigcdn.com', 'segment.io', 'intercomcdn.com',
+                 'challenges.cloudflare.com', 'ippure.com', 'ipinfo.io', 'cf.999831.xyz',
+                 'myip.ipip.net', 'ipify.org', 'ipwho.is', 'ipapi.co', 'freeipapi.com',
+                 'hiofd.com',]
+# 黑名单：强制直连，DNS 用国内服务器。原配置没有显式条目，国内直连由下面的
+# rule_set 承担；只有「规则集判错、必须强制直连」的域名才需要补在这里。
+direct_domains = []
+# 蓝名单：阻断模式下仍允许的连接（域名、IP 或 CIDR）。默认取自原来杀开关的
+# $allowSites：阻断期间仍能访问 DeepSeek、B 站、知乎，便于自己排查和求救。
+isolation_allowlist = [
+                 'deepseek.com', 'api.deepseek.com', 'chat.deepseek.com', 'www.bilibili.com',
+                 'bilibili.com', 'api.bilibili.com', 'www.zhihu.com', 'zhihu.com',
+                 'api.zhihu.com', 'hdslb.com', 'zhimg.com', 'bilivideo.com',]
 # 条目写法：example.com（含子域名）、full:example.com（精确匹配）、1.2.3.4、10.0.0.0/8
 rule_set = ["geosite-cn", "geoip-cn"]   # 判为「国内 → 直连」的规则集；文件缺失时自动跳过
 default_action = "proxy"      # 没有命中任何规则的流量：proxy | direct

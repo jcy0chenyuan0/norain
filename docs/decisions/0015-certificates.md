@@ -72,3 +72,8 @@
 2026-11-14，用户：**以最初目标（docs/reference/original-goals.md）为准，除非有硬性 bug。**
 
 自签证书按最初目标用 `openssl` 命令生成；系统里没有 `openssl` 时退回到 Python `cryptography` 库。ACME 仍然是 sing-box 内置功能，只是 1.14 把写法从 TLS 内联改成了 `certificate_providers`，这属于硬性变化，保持不变。
+
+2026-11-14，代码审查（细化上文「80 端口被占用时给出明确错误」这一条）：
+
+- 上文「推荐方案」说 Trojan 监听 `443/tcp` 时两种挑战方式互为备份，所以 80/tcp 被占用只有在**没有 TLS-ALPN-01 退路**时才算错误。Trojan 监听 443/tcp 时把这一项降级为警告，否则一个本来可用的 ACME 配置会被前置条件挡住启动。
+- 这个错误从 `cert check` 的检查项变成了 `prepare` 的阻断项，会连带挡住 `config validate`、`start`、`install`、`fix`。报错文案因此从「证书无效」分离为「ACME 前置条件不满足」，提示改为域名解析 / 80/tcp / `with_acme` 构建标签，不再指向 manual 模式的证书路径。

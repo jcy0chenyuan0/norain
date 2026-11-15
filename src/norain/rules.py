@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import time
 import tomllib
@@ -165,7 +166,14 @@ class Geo:
         if proc.returncode != 0:
             result = None
         else:
-            result = "match" in (proc.stdout + proc.stderr).lower()
+            output = (proc.stdout + proc.stderr).lower()
+            # Do not treat "no match" as a positive result merely because it
+            # contains the word "match". Keep unknown formats conservative.
+            negative = re.search(r"\b(?:no\s+match|not\s+matched?|unmatched|false)\b|"
+                                 r"\bmatch\s*[:=]\s*(?:no|false|0)\b", output)
+            positive = re.search(r"\b(?:matched?|match|true)\b|"
+                                 r"\bmatch\s*[:=]\s*(?:yes|true|1)\b", output)
+            result = False if negative else True if positive else None
         if len(self._cache) > 4096:
             self._cache.clear()
         self._cache[key] = result

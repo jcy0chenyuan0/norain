@@ -22,7 +22,9 @@ Run = Callable[[list[str]], subprocess.CompletedProcess]
 
 
 def _default_run(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True, timeout=60)
+    # Windows 上不隐藏控制台的话，每次 systemctl / netsh 调用都会闪一个黑窗口
+    return subprocess.run(args, capture_output=True, text=True, timeout=60,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
 
 def detached(paths: Paths) -> DetachedBackend:

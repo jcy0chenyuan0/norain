@@ -16,7 +16,8 @@ from norain_core import tomlio
 
 
 def rnd(dom, frn, d4="CN", p4="US", p6="US", dns=False):
-    loc = lambda c: {"ip": "x", "loc": c} if c else None
+    def loc(c):
+        return {"ip": "x", "loc": c} if c else None
     return Round(at=0, domestic=[{"ok": x} for x in dom], foreign=[{"ok": x} for x in frn],
                  direct_v4=loc(d4), proxy_v4=loc(p4), proxy_v6=loc(p6), dns_home=dns)
 

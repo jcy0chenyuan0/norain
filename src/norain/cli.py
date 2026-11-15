@@ -28,8 +28,8 @@ from pathlib import Path
 from norain_core import apply as core_apply
 from norain_core import atomic, cliutil, osutil, singbox, tomlio
 from norain_core.errors import (BIZ_BINARY_MISSING, BIZ_OK, BIZ_PROCESS_EXITED, EXIT_CONFLICT,
-                                EXIT_DEPENDENCY, EXIT_FAILURE, EXIT_OK, EXIT_PERMISSION, EXIT_USAGE,
-                                NorainError)
+                                EXIT_DEPENDENCY, EXIT_FAILURE, EXIT_OK, EXIT_PERMISSION,
+                                EXIT_TIMEOUT, EXIT_USAGE, NorainError)
 from norain_core.log import Logger, RotatingFile, new_op_id
 from norain_core.state import RUNNING, STOPPED, get_desired, op_lock, read_json, set_desired
 
@@ -105,12 +105,17 @@ def _apply_running(paths: Paths) -> str:
         "正在运行的代理没有接受新配置：" + resp.get("message", ""))
 
 
-def _save_config(paths: Paths, doc: dict) -> tuple[model.ClientConfig, Path | None]:
-    """校验通过才写盘；写之前备份。TOML 注释不会保留。"""
-    cfg = model.parse(doc)
+def _save_config(paths: Paths, doc: dict) -> tuple[model.ClientConfig, Path | None, bool]:
+    """迁移并校验通过才写盘；写之前备份。TOML 注释不会保留。
+
+    写盘写的是迁移后的数据：既然整个文件都要重写，顺手把 ``schema`` 补上，
+    否则「缺少顶层 schema」的 warning 每次加载都会再出现一遍。
+    """
+    migration = model.migrate_doc(doc, source=str(paths.config))
+    cfg = model.parse(migration.data, source=str(paths.config))
     saved = atomic.backup(paths.config, paths.backups) if paths.config.exists() else None
-    atomic.atomic_write(paths.config, tomlio.dumps(doc).encode("utf-8"))
-    return cfg, saved
+    atomic.atomic_write(paths.config, tomlio.dumps(migration.data).encode("utf-8"))
+    return cfg, saved, bool(migration.warnings)
 
 
 def _mutate(args, paths: Paths, changes: dict, text: str) -> int:
@@ -120,8 +125,10 @@ def _mutate(args, paths: Paths, changes: dict, text: str) -> int:
             tomlio.set_path(doc, key, value)
         except KeyError:
             raise NorainError(f"{key} 不是可以设置的配置项", exit_code=EXIT_USAGE, module="config") from None
-    cfg, saved = _save_config(paths, doc)
+    cfg, saved, added_schema = _save_config(paths, doc)
     notes = [_apply_running(paths)]
+    if added_schema:
+        notes.append(f"配置里原来没有顶层 schema，已按版本 {model.SCHEMA_VERSION} 写入")
     if any(k.startswith("app.") or k == "proxy.traffic_mode" for k in changes):
         try:
             notes.append(boot.sync(paths, cfg))   # 正常模式 / 安全模式决定是否开机自启动
@@ -254,7 +261,14 @@ def _start(paths: Paths, op_id: str):
     prep = runner.prepare(paths, apply=False)   # 先在前台报出配置问题
     _preflight(prep)
     set_desired(paths.desired, RUNNING, op_id=op_id)
-    runner.backend(prep.paths).start(timeout=45)
+    try:
+        runner.backend(prep.paths).start(timeout=45)
+    except NorainError as e:
+        # 只有「启动超时」才回滚期望状态：守护进程已经被停掉，留着 running 会被保活方
+        # 反复拉起；其它失败（配置错、进程崩溃）保留 running 让 status 报出原因。
+        if e.exit_code == EXIT_TIMEOUT:
+            set_desired(paths.desired, STOPPED, op_id=op_id)
+        raise
     return prep
 
 
@@ -380,11 +394,11 @@ def cmd_status(args, paths: Paths) -> int:
     print(f"状态：{state}（期望：{'运行' if st['desired'] == RUNNING else '停止'}"
           + (f"，阶段：{st['phase']}" if st.get("phase") else "") + "）")
     if st["config"]["valid"]:
-        p, l = st["proxy"], st["local_proxy"]
+        p, local = st["proxy"], st["local_proxy"]
         active = p.get("active_protocol")
         proto = p["protocol"] + (f" → 当前 {active}" if active and p["protocol"] == "auto" else "")
         print(f"服务器：{p['server']}（{proto}），接管方式：{p['traffic_mode']}")
-        print(f"本地代理：{l['listen']}:{l['port']}")
+        print(f"本地代理：{local['listen']}:{local['port']}")
         print(f"启动模式：{'正常模式' if st['app']['mode'] == 'normal' else '安全模式'}")
     else:
         print("配置无效，运行 norain config validate 查看详情")
@@ -604,6 +618,8 @@ def cmd_install(args, paths: Paths) -> int:
         traffic_mode=args.traffic_mode, protocol=args.protocol, force=args.force, start=not args.no_start)
     _out(args, res, "\n".join(f"· {s}" for s in res["steps"]) + "".join(f"\n注意：{w}" for w in res["warnings"])
          + f"\n\n配置文件：{res['config']}\n`norain` 命令和环境变量在新开的终端里生效。")
+    if not args.no_start and not res.get("started"):
+        return EXIT_FAILURE   # 装完没起来不能报成功，否则脚本会把失败当成功
     return EXIT_OK
 
 
@@ -700,7 +716,7 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--singbox-path", help="直接使用已有的 sing-box 可执行文件")
     ins.add_argument("--config", help="用这份 cfg.toml 作为初始配置")
     ins.add_argument("--server", help="代理服务器域名或 IP（也可以用环境变量 NORAIN_SERVER）")
-    ins.add_argument("--traffic-mode", default="tun", choices=["tun", "mixed", "system-proxy"])
+    ins.add_argument("--traffic-mode", default="system-proxy", choices=["tun", "mixed", "system-proxy"])
     ins.add_argument("--protocol", default="auto", choices=["auto", "hysteria2", "trojan"])
     ins.add_argument("--force", action="store_true", help="覆盖已有的 cfg.toml（先备份）")
     ins.add_argument("--no-start", action="store_true", help="安装后不启动")

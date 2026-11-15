@@ -53,7 +53,10 @@ class Logger:
         self.module, self.op_id, self.sink = module, op_id or new_op_id(), sink
         self.stderr, self.level = stderr, LEVELS.get(level, 20)
 
-    def log(self, level: str, event: str, **detail) -> None:
+    def log(self, level: str, event: str, /, **detail) -> None:
+        # level / event 只收位置参数：调用方常用 log.info("evt", **obj.as_dict())，
+        # 而 dict 里出现 "level" 或 "event" 键时，普通参数会报
+        # 「got multiple values for argument 'level'」。
         if LEVELS[level] < self.level:
             return
         record = {
