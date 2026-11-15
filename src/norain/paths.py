@@ -99,6 +99,8 @@ class Paths:
     @property
     def proxy_stop(self) -> Path: return self.run_dir / "proxy-stop"
     @property
+    def sysproxy_state(self) -> Path: return self.run_dir / "sysproxy.json"   # 启动前的系统代理快照
+    @property
     def watchdog_file(self) -> Path: return self.run_dir / "watchdog.json"    # 看门狗进程
     @property
     def block_state(self) -> Path: return self.state / "isolation.json"       # 阻断模式

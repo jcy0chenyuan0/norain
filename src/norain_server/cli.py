@@ -471,3 +471,7 @@ def main(argv: list[str] | None = None) -> int:
             deploy.sync_ownership(paths)
         except OSError:
             pass
+
+
+if __name__ == "__main__":  # python -m norain_server.cli 也要能用；缺了它会静默退出 0
+    raise SystemExit(main())

@@ -742,3 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001 调试输出出错不能改变命令的退出码
             print(f"（无法读取模块状态：{e}）", file=sys.stderr)
     return code
+
+
+if __name__ == "__main__":  # python -m norain.cli 也要能用；缺了它会静默退出 0
+    raise SystemExit(main())

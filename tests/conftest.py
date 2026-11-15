@@ -97,3 +97,31 @@ def server(tmp_path, monkeypatch):
     assert r.returncode == 0, r.stderr
     yield e
     e.cli("stop")
+
+# ---- 可选进度条：默认关闭（NORAIN_TEST_PROGRESS=1 打开）。每 10% 打一行，不重绘、不闪。 ----
+
+_PROGRESS = {"total": 0, "done": 0, "step": 10, "enabled": False}
+
+
+def pytest_configure(config):
+    _PROGRESS["enabled"] = os.environ.get("NORAIN_TEST_PROGRESS", "") not in ("", "0")
+
+
+def pytest_collection_modifyitems(session, config, items):
+    _PROGRESS["total"] = len(items)
+
+
+def pytest_runtest_logreport(report):
+    if not _PROGRESS["enabled"]:
+        return
+    if report.when != "call" and not (report.when == "setup" and report.skipped):
+        return
+    _PROGRESS["done"] += 1
+    total = max(_PROGRESS["total"], 1)
+    pct = _PROGRESS["done"] * 100 // total
+    # 只在跨过 10% 或出错时输出一行，避免刷屏
+    if pct < _PROGRESS["step"] and not report.failed:
+        return
+    _PROGRESS["step"] = (pct // 10 + 1) * 10
+    mark = "FAIL" if report.failed else ("skip" if report.skipped else "ok")
+    print(f"[{pct:3d}%] {_PROGRESS['done']}/{total}  {mark}  {report.nodeid[-60:]}", flush=True)

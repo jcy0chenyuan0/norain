@@ -170,7 +170,11 @@ class Geo:
         key = (name, value, mtime)
         if key in self._cache:
             return self._cache[key]
-        proc = osutil.run([str(self.binary), "rule-set", "match", str(f), value], timeout=10)
+        # 规则集是二进制的 .srs：不加 -f binary 时真实 sing-box 会把它当 JSON 解析并 FATAL（exit 1），
+        # 「是否国内」就永远拿不到结论（2026-11-15 用 1.14.4 实测）。命中时输出
+        # "match rules.[0]: ..."，未命中时输出为空且 exit 0——空输出必须判为不命中。
+        fmt = "binary" if f.suffix.lower() == ".srs" else "source"
+        proc = osutil.run([str(self.binary), "rule-set", "match", "-f", fmt, str(f), value], timeout=10)
         if proc.returncode != 0:
             result = None
         else:
@@ -181,7 +185,14 @@ class Geo:
                                  r"\bmatch\s*[:=]\s*(?:no|false|0)\b", output)
             positive = re.search(r"\b(?:matched?|match|true)\b|"
                                  r"\bmatch\s*[:=]\s*(?:yes|true|1)\b", output)
-            result = False if negative else True if positive else None
+            if negative:
+                result = False
+            elif positive:
+                result = True
+            elif not output.strip():
+                result = False      # exit 0 且没有任何输出 = 不命中
+            else:
+                result = None       # 输出格式不认识：保守处理
         if len(self._cache) > 4096:
             self._cache.clear()
         self._cache[key] = result

@@ -210,9 +210,19 @@ def install(paths: Paths, *, archive: Path | None = None, sha256: str | None = N
 
 
 def clear_system_proxy(paths: Paths) -> str | None:
-    """system-proxy 模式异常退出后系统代理可能残留。只在它指向本机回环地址时才清除。"""
+    """system-proxy 模式异常退出后系统代理可能残留。
+
+    优先按启动前的快照原样还原（ProxyServer / ProxyOverride 都回填）；没有快照时，
+    只在当前值指向本机回环地址时才把 ProxyEnable 关掉。
+    """
     if not osutil.IS_WINDOWS or osutil.system_changes_disabled():
         return None
+    from norain_core import sysproxy
+
+    snapshot = sysproxy.load(paths.sysproxy_state)
+    if snapshot and sysproxy.write(snapshot):
+        sysproxy.discard(paths.sysproxy_state)
+        return f"已按启动前的快照还原系统代理设置（ProxyServer={snapshot.get('ProxyServer')}）"
     try:
         import winreg
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"

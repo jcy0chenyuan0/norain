@@ -232,7 +232,9 @@ class Controller:
         classifier = Classifier(cfg, paths, self.geo, direct=self._probe("direct"),
                                 proxy=self._probe(self.active), internet_ok=self.monitor.internet_ok)
         self.router = Router(cfg, paths, classifier, self._logger("routing"), on_change=self._want_reload)
-        self.proxy = ProxyModule(self._spec)
+        self.proxy = ProxyModule(self._spec,
+                                 sysproxy_state=(paths.sysproxy_state
+                                                 if cfg.proxy.traffic_mode == "system-proxy" else None))
         self.maintainer = maintain.Maintainer(self, self._logger("maintain"))
         self.selector = Selector(cfg, paths, self._logger("control")) if cfg.proxy.protocol == "auto" else None
         self.modules = {"routing": self.router, "proxy": self.proxy, "monitor": self.monitor,

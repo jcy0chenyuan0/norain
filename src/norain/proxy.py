@@ -11,6 +11,9 @@ import threading
 import time
 from typing import Callable
 
+from pathlib import Path
+
+from norain_core import sysproxy
 from norain_core.errors import EXIT_OK
 from norain_core.state import read_json
 from norain_core.supervisor import STOP_GRACE_SECONDS, Spec, Supervisor
@@ -19,8 +22,12 @@ from norain_core.supervisor import STOP_GRACE_SECONDS, Spec, Supervisor
 class ProxyModule:
     name = "proxy"
 
-    def __init__(self, spec_fn: Callable[[], Spec]) -> None:
+    def __init__(self, spec_fn: Callable[[], Spec], sysproxy_state: Path | None = None) -> None:
         self._spec_fn = spec_fn
+        # traffic_mode = system-proxy 时由 sing-box 写系统代理；它被硬杀时不还原，所以这里自己记账
+        self._sysproxy_state = sysproxy_state
+        self._sysproxy_snapshot: dict | None = None
+        self._sysproxy_lock = threading.Lock()
         self.spec: Spec | None = None
         self.sup: Supervisor | None = None
         self.exit_code: int | None = None
@@ -35,11 +42,47 @@ class ProxyModule:
             self.exit_code = 1
         finally:
             self._lifetime_restarts += sup.total_restarts
+            self._restore_snapshot()   # sing-box 已退出（含被硬杀）：把系统代理写回原样
+
+    # ---- 系统代理快照：sing-box 的 set_system_proxy 不保证还原（见 norain_core.sysproxy） ----
+
+    def _restore_stale(self) -> None:
+        """上次被强杀留下的快照：在重新启动前先还原，避免系统代理一直指着死端口。"""
+        path = self._sysproxy_state
+        if path is None:
+            return
+        values = sysproxy.load(path)
+        if values:
+            sysproxy.write(values)
+            sysproxy.discard(path)
+
+    def _save_snapshot(self) -> None:
+        if self._sysproxy_state is None:
+            return
+        values = sysproxy.read()
+        if values is None:
+            return
+        self._sysproxy_snapshot = values
+        sysproxy.save(self._sysproxy_state, values)
+
+    def _restore_snapshot(self) -> None:
+        with self._sysproxy_lock:
+            values, self._sysproxy_snapshot = self._sysproxy_snapshot, None
+        if values is None or self._sysproxy_state is None:
+            return
+        sysproxy.write(values)
+        sysproxy.discard(self._sysproxy_state)
 
     def start(self) -> None:
         if self.alive():
             return
-        self.spec = self._spec_fn()
+        self._restore_stale()
+        self._save_snapshot()
+        try:
+            self.spec = self._spec_fn()
+        except Exception:
+            self._restore_snapshot()
+            raise
         self.sup = Supervisor(self.spec)
         self.exit_code = None
         self.started_at = time.time()
@@ -51,6 +94,7 @@ class ProxyModule:
             self.sup.request_stop()
         if self._thread is not None:
             self._thread.join(STOP_GRACE_SECONDS + 10)
+        self._restore_snapshot()
 
     def alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
