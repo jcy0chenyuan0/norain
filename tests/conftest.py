@@ -12,6 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests" / "fakes" / ("sing-box.cmd" if os.name == "nt" else "sing-box")
 PASSWORD = "s3cr3t-Pa55w0rd-for-tests"
 
+# 硬保险：测试进程以及它启动的所有子进程（守护进程、看门狗）都不执行任何会读写系统网络、
+# 防火墙、计划任务、服务或注册表的命令（见 norain_core.osutil.NO_SYSTEM_ENV）。
+os.environ["NORAIN_NO_SYSTEM_CHANGES"] = "1"
+
 
 def free_port(kind=socket.SOCK_STREAM) -> int:
     with socket.socket(socket.AF_INET, kind) as s:
@@ -37,7 +41,7 @@ class Env:
             **{k: v for k, v in os.environ.items() if not k.startswith(("NORAIN_", "FAKE_SB_"))},
             "NORAIN_SERVER_HOME": str(self.home), "NORAIN_SERVER_STATE": str(self.state),
             "NORAIN_SERVER_LOG": str(self.logs), "NORAIN_SERVER_SINGBOX": str(FAKE),
-            "NORAIN_SERVER_BACKEND": "detached",
+            "NORAIN_SERVER_BACKEND": "detached", "NORAIN_NO_SYSTEM_CHANGES": "1",
             "PYTHONPATH": str(ROOT / "src"),
         }
         self.write_config()

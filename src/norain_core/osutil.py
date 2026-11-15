@@ -18,6 +18,24 @@ from .redact import redact
 
 IS_WINDOWS = os.name == "nt"
 
+# 设置了这个环境变量后，任何会读写系统网络 / 防火墙 / 计划任务 / 服务 / 注册表的命令都不执行
+# （返回退出码 126）。测试套件用它保证不碰真实的系统设置。
+NO_SYSTEM_ENV = "NORAIN_NO_SYSTEM_CHANGES"
+_SYSTEM_COMMANDS = frozenset({
+    "netsh", "nft", "ufw", "firewall-cmd", "iptables", "ip6tables", "schtasks", "setx", "systemctl",
+    "powershell", "pwsh", "reg", "sysctl", "ip", "route", "resolvectl", "networksetup", "wall",
+    "runuser", "useradd", "userdel",
+})
+
+
+def system_changes_disabled() -> bool:
+    return os.environ.get(NO_SYSTEM_ENV, "") not in ("", "0")
+
+
+def _is_system_command(args: list[str]) -> bool:
+    name = Path(str(args[0])).name.lower()
+    return (name[:-4] if name.endswith(".exe") else name) in _SYSTEM_COMMANDS
+
 
 # ---- 权限与命令 ----------------------------------------------------------------
 
@@ -39,6 +57,8 @@ def require_admin(what: str, *, module: str = "core") -> None:
 
 def run(args: list[str], *, timeout: float = 60, input_text: str | None = None) -> subprocess.CompletedProcess:
     """执行外部命令并捕获输出。命令不存在时返回 returncode=127，而不是抛异常。"""
+    if system_changes_disabled() and _is_system_command(args):
+        return subprocess.CompletedProcess(args, 126, "", f"已禁用系统命令（{NO_SYSTEM_ENV}）：{args[0]}")
     extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}
     try:
         return subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout,
@@ -112,6 +132,8 @@ def _win_broadcast_env() -> None:
 
 def _win_env_key(system: bool, write: bool):
     import winreg
+    if write and system_changes_disabled():
+        raise NorainError(f"已禁用系统改动（{NO_SYSTEM_ENV}），不写注册表", exit_code=EXIT_PERMISSION, module="core")
     root = winreg.HKEY_LOCAL_MACHINE if system else winreg.HKEY_CURRENT_USER
     access = winreg.KEY_READ | (winreg.KEY_SET_VALUE if write else 0)
     return winreg.OpenKey(root, _WIN_ENV_SYSTEM if system else _WIN_ENV_USER, 0, access)

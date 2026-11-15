@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from typing import Callable
 
+from norain_core import osutil
 from norain_core.daemonctl import DetachedBackend, ServiceStatus, runner_info
 from norain_core.errors import EXIT_EXTERNAL, EXIT_PERMISSION, NorainError
 from norain_core.redact import redact
@@ -22,9 +23,7 @@ Run = Callable[[list[str]], subprocess.CompletedProcess]
 
 
 def _default_run(args: list[str]) -> subprocess.CompletedProcess:
-    # Windows 上不隐藏控制台的话，每次 systemctl / netsh 调用都会闪一个黑窗口
-    return subprocess.run(args, capture_output=True, text=True, timeout=60,
-                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    return osutil.run(args)   # 隐藏控制台窗口；命令不存在或超时时返回非零退出码而不是抛异常
 
 
 def detached(paths: Paths) -> DetachedBackend:

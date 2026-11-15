@@ -223,6 +223,7 @@ class Router:
                  on_change: Callable[[], None]) -> None:
         self.cfg, self.paths, self.classifier, self.log, self.on_change = cfg, paths, classifier, log, on_change
         self.learned = load_learned(paths)
+        self._learn = bool(cfg.routing.learn)   # feed() 每行日志都读它，取成普通属性
         self._q: queue.Queue[str] = queue.Queue(maxsize=256)
         self._conns: OrderedDict[str, tuple[str, str]] = OrderedDict()   # 连接 ID → (出站, 主机)
         self._fails: dict[str, int] = {}
@@ -234,16 +235,22 @@ class Router:
 
     # sing-box 的每一行输出都会经过这里（在日志泵线程里），必须很快返回
     def feed(self, line: str) -> None:
-        if not self.cfg.routing.learn:
+        if not self._learn:
             return
-        line = _ANSI.sub("", line)
-        m = _CONN.search(line)
-        if m:
-            cid, tag, host = m.group(1), m.group(2), m.group(3).lower()
-            self._conns[cid] = (tag, host)
-            if len(self._conns) > 2000:
-                self._conns.popitem(last=False)
+        # 绝大多数日志行两种都不是：先用子串检查排除，再动用正则
+        is_conn = "connection to " in line
+        if not is_conn and "ERROR" not in line:
             return
+        if "\x1b" in line:
+            line = _ANSI.sub("", line)
+        if is_conn:
+            m = _CONN.search(line)
+            if m:
+                cid, tag, host = m.group(1), m.group(2), m.group(3).lower()
+                self._conns[cid] = (tag, host)
+                if len(self._conns) > 2000:
+                    self._conns.popitem(last=False)
+                return
         m = _ERR.search(line)
         if not m:
             return
@@ -257,8 +264,11 @@ class Router:
         self._fails[host] = self._fails.get(host, 0) + 1
         if len(self._fails) > 2000:
             self._fails.clear()
-        if self._fails[host] >= FAILURES_BEFORE_CLASSIFY and time.time() - self._last.get(host, 0) > RETRY_COOLDOWN:
-            self._last[host] = time.time()
+        now = time.time()
+        if self._fails[host] >= FAILURES_BEFORE_CLASSIFY and now - self._last.get(host, 0) > RETRY_COOLDOWN:
+            if len(self._last) > 2000:   # 只保留还在冷却期内的记录，长期运行时不会无限增长
+                self._last = {h: t for h, t in self._last.items() if now - t <= RETRY_COOLDOWN}
+            self._last[host] = now
             self._fails.pop(host, None)
             try:
                 self._q.put_nowait(host)

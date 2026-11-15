@@ -19,21 +19,46 @@ def new_op_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+_APPEND = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    """同一进程里指向同一个文件的 RotatingFile 共用一把锁，否则两个对象可能同时轮转。"""
+    key = os.path.normcase(os.path.abspath(path))
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
+
+
 class RotatingFile:
     def __init__(self, path: Path, *, max_bytes: int, keep: int) -> None:
         self.path, self.max_bytes, self.keep = path, max_bytes, max(keep, 1)
-        self._lock = threading.Lock()
+        self._lock = _lock_for(path)
 
     def write_line(self, line: str) -> None:
+        """追加一行。sing-box 的每一行输出都会走这里，所以只做必要的系统调用。"""
         data = (line.rstrip("\n") + "\n").encode("utf-8", "replace")
         with self._lock:
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                if self.path.exists() and self.path.stat().st_size + len(data) > self.max_bytes:
-                    self._rotate()
-                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
-                with os.fdopen(fd, "ab") as f:
-                    f.write(data)
+                try:
+                    size = os.stat(self.path).st_size
+                except FileNotFoundError:
+                    size = 0
+                if size and size + len(data) > self.max_bytes:
+                    try:
+                        self._rotate()
+                    except OSError:
+                        pass  # 轮转失败（Windows 上文件正被 `logs -f` 打开）时照常追加，不丢日志
+                try:
+                    fd = os.open(self.path, _APPEND, 0o640)
+                except FileNotFoundError:  # 日志目录只在缺失时才创建
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    fd = os.open(self.path, _APPEND, 0o640)
+                try:
+                    os.write(fd, data)
+                finally:
+                    os.close(fd)
             except OSError:
                 pass  # 日志写失败不能拖垮主流程
 

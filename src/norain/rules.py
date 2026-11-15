@@ -141,11 +141,15 @@ def due(cfg: ClientConfig, paths: Paths) -> bool:
     names = [n for n in cfg.routing.rule_set if n in KNOWN_RULE_SETS]
     if not names:
         return False
-    if any(not path_of(paths, n).is_file() for n in names):
-        last_try = _index(paths).get("_checked_at", 0)
-        return time.time() - last_try > 600  # 下载失败时每 10 分钟重试一次
+    missing = any(not path_of(paths, n).is_file() for n in names)
     hours = cfg.routing.update_interval_hours
-    return bool(hours) and time.time() - _index(paths).get("_checked_at", 0) > hours * 3600
+    if not missing and not hours:
+        return False
+    checked = _index(paths).get("_checked_at", 0)
+    if not isinstance(checked, (int, float)):
+        checked = 0   # 索引文件被改坏时按「从未检查过」处理，而不是抛 TypeError
+    # 文件缺失（下载失败）时每 10 分钟重试一次
+    return time.time() - checked > (600 if missing else hours * 3600)
 
 
 class Geo:
@@ -153,15 +157,19 @@ class Geo:
 
     def __init__(self, binary: Path, paths: Paths) -> None:
         self.binary, self.paths = binary, paths
-        self._cache: dict[tuple[str, str], bool | None] = {}
+        self._cache: dict[tuple[str, str, int], bool | None] = {}
+        self._files: dict[str, Path] = {}
 
     def _match(self, name: str, value: str) -> bool | None:
-        key = (name, value)
+        f = self._files.get(name) or self._files.setdefault(name, path_of(self.paths, name))
+        try:
+            mtime = os.stat(f).st_mtime_ns
+        except OSError:
+            return None
+        # 缓存键带规则集文件的修改时间：规则集更新或回滚之后，旧结论自动失效
+        key = (name, value, mtime)
         if key in self._cache:
             return self._cache[key]
-        f = path_of(self.paths, name)
-        if not f.is_file():
-            return None
         proc = osutil.run([str(self.binary), "rule-set", "match", str(f), value], timeout=10)
         if proc.returncode != 0:
             result = None

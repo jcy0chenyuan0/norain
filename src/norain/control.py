@@ -43,6 +43,9 @@ BOOT, RUNNING_PHASE, REPAIRING, BLOCKED, STOPPING = "boot-test", "running", "rep
 MODULES = ("proxy", "routing", "monitor", "maintain", "block", "repair", "boot", "control", "cli")
 ACTIVE_MODULES = ("routing", "proxy", "monitor", "maintain")   # 有自己线程、可以启动和结束的模块
 RELOAD_DEBOUNCE = 30.0   # 分流学习触发的重载之间的最小间隔（重载会中断已有连接）
+STATE_HEARTBEAT = 30.0   # 状态没有变化时，状态文件最多隔这么久刷新一次
+RULES_CHECK_INTERVAL = 60.0   # 多久看一次规则集是否到了更新时间（更新间隔以小时计，不需要每半秒看）
+REQUEST_MAX_AGE = 120.0  # 命令行请求和回应文件的最长保留时间
 
 
 # ---- 命令行 → 内控制 的请求通道 ------------------------------------------------
@@ -168,6 +171,10 @@ class Controller:
         self._rules_report: dict | None = None
         self._boot_info: dict = {}
         self._autostart_registered: bool | None = None
+        self._last_runner: dict | None = None
+        self._last_status: dict | None = None
+        self._state_written_at = 0.0
+        self._next_rules_check = 0.0
         self.log: Logger = Logger("control", stderr=True)
 
     # ---- 构建 ----
@@ -400,8 +407,11 @@ class Controller:
 
     def _tick_rules(self) -> None:
         """分流模块的自更新：到期时在后台线程里下载，不阻塞主循环。"""
-        if self.phase != RUNNING_PHASE or (self._rules_thread and self._rules_thread.is_alive()):
+        if self.phase != RUNNING_PHASE or time.monotonic() < self._next_rules_check:
             return
+        if self._rules_thread and self._rules_thread.is_alive():
+            return
+        self._next_rules_check = time.monotonic() + RULES_CHECK_INTERVAL
         if rules.due(self.cfg, self.paths):
             self._rules_thread = threading.Thread(target=self._update_rules, name="norain-rules", daemon=True)
             self._rules_thread.start()
@@ -432,12 +442,24 @@ class Controller:
         }
 
     def _write_state(self) -> None:
+        """把运行状态写给命令行看。内容没有变化时不写盘（最多每 STATE_HEARTBEAT 秒刷新一次）；
+        这两个文件丢了可以重建，所以不 fsync——否则常驻进程每秒都在强制刷盘。"""
+        runner = {"pid": os.getpid(), "child_pid": self.proxy.child_pid, "ready": self.proxy.ready,
+                  "restarts": self.proxy.restarts, "phase": self.phase, "started_at": self.started_at,
+                  "log_file": str(self.paths.log_file)}
+        status = self.status()
+        stamp = status.pop("updated_at")
+        now = time.monotonic()
+        stale = now - self._state_written_at >= STATE_HEARTBEAT
         try:
-            write_json(self.paths.runner, {
-                "pid": os.getpid(), "child_pid": self.proxy.child_pid, "ready": self.proxy.ready,
-                "restarts": self.proxy.restarts, "phase": self.phase, "started_at": self.started_at,
-                "log_file": str(self.paths.log_file)})
-            write_json(self.paths.status_file, self.status())
+            if stale or runner != self._last_runner or not self.paths.runner.exists():
+                write_json(self.paths.runner, runner, durable=False)
+                self._last_runner = runner
+            if stale or status != self._last_status:
+                write_json(self.paths.status_file, {**status, "updated_at": stamp}, durable=False)
+                self._last_status = status
+            if stale:
+                self._state_written_at = now
         except OSError:
             pass
 
@@ -488,13 +510,35 @@ class Controller:
 
     def _serve(self) -> None:
         d = self.paths.ctl_dir
-        if not d.is_dir():
+        try:
+            names = sorted(os.listdir(d))   # 一次系统调用；目录不存在或为空是常态
+        except OSError:
             return
-        for req_file in sorted(d.glob("*.req.json")):
-            req = read_json(req_file)
-            req_file.unlink(missing_ok=True)
-            if not req or time.time() - req.get("at", 0) > 120:
+        now = time.time()
+        for name in names:
+            if name.endswith(".resp.json"):
+                # 命令行等不到回应就走了（超时、被中断）：没人会来取的回应不能一直堆在目录里
+                try:
+                    if now - (d / name).stat().st_mtime > REQUEST_MAX_AGE:
+                        (d / name).unlink(missing_ok=True)
+                except OSError:
+                    pass
                 continue
+            if not name.endswith(".req.json"):
+                continue
+            req_file = d / name
+            req = read_json(req_file)
+            try:
+                req_file.unlink(missing_ok=True)
+            except OSError:
+                continue   # 删不掉就不处理，否则同一个请求会被反复执行
+            if not isinstance(req, dict):
+                continue
+            at = req.get("at", 0)
+            if not isinstance(at, (int, float)) or now - at > REQUEST_MAX_AGE:
+                continue
+            # 回应文件名取自请求文件名，不信任请求内容里的 id（缺失时会 KeyError，拖垮整个内控制）
+            rid = name[:-len(".req.json")]
             try:
                 resp = self._handle(req)
             except NorainError as e:
@@ -503,7 +547,10 @@ class Controller:
                 resp = {"ok": False, "message": f"处理请求时出错：{e!r}"}
             self.last_request = {"at": time.strftime("%H:%M:%S"), "op": req.get("op"),
                                  "ok": resp.get("ok"), "message": resp.get("message")}
-            write_json(d / f"{req['id']}.resp.json", resp)
+            try:
+                write_json(d / f"{rid}.resp.json", resp, durable=False)
+            except (OSError, TypeError, ValueError) as e:   # 回应写不出去只影响这一个请求
+                self.log.error("control.response_failed", op=str(req.get("op")), error=repr(e))
 
     def _reconfigure(self) -> dict:
         """cfg.toml 改过之后重新加载：新配置通过校验才替换，否则继续用旧配置运行。"""

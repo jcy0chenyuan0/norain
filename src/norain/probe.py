@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import socket
 import ssl
@@ -38,12 +39,25 @@ class Result:
                 "error": self.error}
 
 
-def _opener(proxy: Proxy, *, verify: bool) -> urllib.request.OpenerDirector:
+@functools.lru_cache(maxsize=2)
+def _ssl_context(verify: bool) -> ssl.SSLContext:
+    """TLS 上下文只建两个（校验 / 不校验）并复用。
+
+    create_default_context() 每次都要加载系统的整个 CA 证书库（Windows 上要枚举证书存储），
+    而监控每一轮有十来个探测、每个探测都新建一次——这是探测路径上最大的一笔固定开销。
+    SSLContext 可以在线程间共享。
+    """
     ctx = ssl.create_default_context()
     if not verify:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    handlers: list = [urllib.request.HTTPSHandler(context=ctx)]
+    return ctx
+
+
+@functools.lru_cache(maxsize=32)
+def _opener(proxy: Proxy, verify: bool) -> urllib.request.OpenerDirector:
+    """按（本地入口, 是否校验证书）缓存 opener：入口只有固定的几个，opener 不带连接状态。"""
+    handlers: list = [urllib.request.HTTPSHandler(context=_ssl_context(verify))]
     if proxy:
         addr = f"http://{proxy[0]}:{proxy[1]}"
         handlers.append(urllib.request.ProxyHandler({"http": addr, "https": addr}))
@@ -58,7 +72,7 @@ def http(url: str, *, proxy: Proxy = None, timeout: float = 5.0, via: str = "", 
     req = urllib.request.Request(url, method=method, headers={"User-Agent": _UA, **(headers or {})})
     started = time.monotonic()
     try:
-        with _opener(proxy, verify=verify).open(req, timeout=timeout) as r:
+        with _opener(tuple(proxy) if proxy else None, verify).open(req, timeout=timeout) as r:
             body = r.read(max_bytes).decode("utf-8", "replace")
             return Result(True, url, via, r.status, (time.monotonic() - started) * 1000, body=body)
     except urllib.error.HTTPError as e:
@@ -104,10 +118,7 @@ def tcp(host: str, port: int, *, proxy: Proxy = None, timeout: float = 5.0) -> b
                 return False
             if port != 443:
                 return True
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with ctx.wrap_socket(s, server_hostname=None):
+            with _ssl_context(False).wrap_socket(s, server_hostname=None):
                 return True
     except (OSError, ssl.SSLError):
         return False

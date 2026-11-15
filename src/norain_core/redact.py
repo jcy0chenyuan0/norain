@@ -14,24 +14,32 @@ _KEY_VALUE = re.compile(
     r"""(["']?(?:password|passwd|token|secret|private_key|mac_key)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,}]+)""",
     re.I,
 )
+_KEY_HINT = re.compile(r"passw|token|secret|_key", re.I)  # _KEY_VALUE 能命中的必要条件
 _SECRET_KEYS = {"password", "passwd", "token", "secret", "private_key", "mac_key", "key"}
 
 
 class Redactor:
     def __init__(self) -> None:
         self._secrets: set[str] = set()
+        self._ordered: tuple[str, ...] = ()
 
     def register(self, value: str) -> None:
-        if value:
+        if value and value not in self._secrets:
             self._secrets.add(value)
+            # 长的在前，避免一个秘密是另一个的子串时泄漏剩余部分；只在登记时排序一次
+            self._ordered = tuple(sorted(self._secrets, key=len, reverse=True))
 
     def redact(self, text: str) -> str:
-        # 先替换长的秘密，避免一个秘密是另一个的子串时泄漏剩余部分
-        for secret in sorted(self._secrets, key=len, reverse=True):
-            text = text.replace(secret, MASK)
-        text = _PEM_KEY.sub(MASK, text)
-        text = _AUTH_URL.sub(lambda m: m.group(1) + MASK + "@", text)
-        text = _KEY_VALUE.sub(lambda m: m.group(1) + MASK, text)
+        # 每一行日志都会经过这里：先用便宜的子串检查排除绝大多数不含敏感内容的行
+        for secret in self._ordered:
+            if secret in text:
+                text = text.replace(secret, MASK)
+        if "PRIVATE KEY-----" in text:
+            text = _PEM_KEY.sub(MASK, text)
+        if "://" in text and "@" in text:
+            text = _AUTH_URL.sub(lambda m: m.group(1) + MASK + "@", text)
+        if _KEY_HINT.search(text):
+            text = _KEY_VALUE.sub(lambda m: m.group(1) + MASK, text)
         return text
 
     def redact_obj(self, obj):

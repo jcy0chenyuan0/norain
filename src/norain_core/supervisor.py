@@ -122,15 +122,19 @@ class Supervisor:
         self.spec = spec
         self._stop = threading.Event()
         self._reload = threading.Event()
+        self._wake = threading.Event()   # 停止或重载请求到来时立刻唤醒监督循环
         self._child: subprocess.Popen | None = None
         self._fatal: str | None = None
         self.total_restarts = 0
+        self.ready = False               # 当前子进程的端口是否都已开始监听
 
     def request_stop(self, *_args) -> None:
         self._stop.set()
+        self._wake.set()
 
     def request_reload(self) -> None:
         self._reload.set()
+        self._wake.set()
 
     @property
     def child_pid(self) -> int | None:
@@ -147,12 +151,24 @@ class Supervisor:
         return hit
 
     def _stop_requested(self, wait: float) -> bool:
-        if self._stop.wait(wait):
-            return True
-        if self.spec.stop_file.exists():
-            self._stop.set()
-            return True
-        return False
+        """最多等 wait 秒，返回是否收到停止请求。
+
+        进程内的请求（request_stop / request_reload）立刻唤醒；停止请求文件每 0.5 秒看一次，
+        这样长时间的退避等待期间 Windows 上的 `stop` 也能及时生效。有重载请求时提前返回 False。
+        """
+        deadline = time.monotonic() + wait
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and not self._stop.is_set() and not self._reload.is_set():
+                self._wake.wait(min(remaining, 0.5))
+                self._wake.clear()
+            if self._stop.is_set():
+                return True
+            if self.spec.stop_file.exists():
+                self._stop.set()
+                return True
+            if remaining <= 0.5 or self._reload.is_set():
+                return False
 
     def _pump(self, child: subprocess.Popen, sink: RotatingFile) -> None:
         assert child.stdout is not None
@@ -203,12 +219,22 @@ class Supervisor:
                     pass
 
     def _write_runner(self, child_pid: int | None, consecutive: int, ready: bool = False) -> None:
-        write_json(self.spec.runner_file, {
+        self.ready = ready
+        record = {
             "pid": os.getpid(), "child_pid": child_pid, "ready": ready,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "restarts": self.total_restarts, "consecutive_restarts": consecutive,
             "config_version": self._config_version(), "log_file": str(self.spec.log_file),
-        })
+        }
+        # 运行状态文件丢了可以重建，不需要 fsync；写失败（磁盘满、Windows 上的瞬时文件锁）
+        # 不能让监督器退出——那会把一个正常运行的 sing-box 判成故障
+        for attempt in (1, 2):
+            try:
+                write_json(self.spec.runner_file, record, durable=False)
+                return
+            except OSError:
+                if attempt == 1:
+                    time.sleep(0.1)
 
     def _config_version(self) -> str:
         """重载后配置文件内容会变，版本号以磁盘上的当前配置为准。"""
@@ -224,7 +250,8 @@ class Supervisor:
         next_check = started + spec.check_interval
         ready = False
         while True:
-            if self._stop_requested(0.2):
+            # 就绪之前轮询得快一些（尽早报告就绪）；就绪之后放慢，减少空转
+            if self._stop_requested(0.5 if ready else 0.2):
                 self._terminate(child)
                 return None
             if self._reload_requested():
@@ -276,6 +303,7 @@ class Supervisor:
         try:
             while True:
                 self._fatal = None
+                self._reload_requested()   # 马上要用最新配置启动：之前积压的重载请求已经满足
                 child = subprocess.Popen(
                     [str(spec.binary), "run", "-c", str(spec.config_json)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -289,6 +317,7 @@ class Supervisor:
                 pump.start()
 
                 reason = self._supervise(child, log, consecutive)
+                self.ready = False
                 pump.join(2)
                 if reason is None:
                     log.info("daemon.stopped", reason="stop requested")

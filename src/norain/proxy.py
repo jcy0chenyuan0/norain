@@ -11,7 +11,6 @@ import threading
 import time
 from typing import Callable
 
-from norain_core.daemonctl import alive as pid_alive
 from norain_core.errors import EXIT_OK
 from norain_core.state import read_json
 from norain_core.supervisor import STOP_GRACE_SECONDS, Spec, Supervisor
@@ -68,10 +67,9 @@ class ProxyModule:
     @property
     def ready(self) -> bool:
         """sing-box 在运行，并且所有本地端口都已开始监听。"""
-        if not self.alive() or self.spec is None:
-            return False
-        info = read_json(self.spec.runner_file) or {}
-        return bool(info.get("ready")) and pid_alive(info.get("child_pid"))
+        # 直接问监督器（同一进程里的对象）：这个属性每秒被读很多次，不值得每次读状态文件再查进程表
+        sup = self.sup
+        return bool(sup is not None and self.alive() and sup.ready and sup.child_pid is not None)
 
     @property
     def restarts(self) -> int:

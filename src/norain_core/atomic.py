@@ -4,25 +4,58 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
-
-def write_private(path: Path, data: bytes) -> None:
-    """以 0600 权限写入并 fsync。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(path, 0o600)
+_BINARY = getattr(os, "O_BINARY", 0)   # Windows 上不加它，os.open 得到的是文本模式的描述符
 
 
-def atomic_write(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    write_private(tmp, data)
-    os.replace(tmp, path)
+def write_private(path: Path, data: bytes, *, durable: bool = True) -> None:
+    """以 0600 权限写入。durable=True 时 fsync（配置、秘密等掉电后必须完整的文件）。"""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _BINARY
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileNotFoundError:   # 目录通常已经存在：只在缺失时才创建，省掉每次写入前的 mkdir
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        if durable:
+            os.fsync(fd)
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)   # 文件已存在时 os.open 的 mode 不生效
+    finally:
+        os.close(fd)
+
+
+def replace(src: Path, dst: Path, *, attempts: int = 6) -> None:
+    """os.replace。Windows 上目标文件正被别的进程读取时会短暂报 PermissionError，重试几次。"""
+    for n in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if os.name != "nt" or n + 1 == attempts:
+                raise
+            time.sleep(0.02 * (n + 1))
+
+
+def atomic_write(path: Path, data: bytes, *, durable: bool = True) -> None:
+    """写临时文件再原子替换。durable=False 用于高频改写的状态文件（丢了可以重建，不值得 fsync）。"""
+    # 临时文件名带线程 ID：同一进程的两个线程同时写同一个文件时不会互相踩临时文件
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        write_private(tmp, data, durable=durable)
+        replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def backup(path: Path, backup_dir: Path, *, keep: int = 5) -> Path | None:
@@ -43,5 +76,5 @@ def backup(path: Path, backup_dir: Path, *, keep: int = 5) -> Path | None:
 def promote(candidate: Path, current: Path, backup_dir: Path, *, keep: int = 5) -> Path | None:
     """备份 current，再用 candidate 原子替换它。返回备份路径。"""
     saved = backup(current, backup_dir, keep=keep)
-    os.replace(candidate, current)
+    replace(candidate, current)
     return saved

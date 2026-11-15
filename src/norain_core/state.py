@@ -21,8 +21,10 @@ def read_json(path: Path) -> dict | None:
         return None
 
 
-def write_json(path: Path, obj: dict) -> None:
-    atomic_write(path, json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2).encode())
+def write_json(path: Path, obj: dict, *, durable: bool = True) -> None:
+    """durable=False：不 fsync，用于每隔几秒就改写一次的运行状态文件。"""
+    atomic_write(path, json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2).encode(),
+                 durable=durable)
 
 
 def get_desired(path: Path) -> str:
@@ -56,6 +58,13 @@ def lock_holder(path: Path) -> dict | None:
     return data
 
 
+def _just_created(path: Path, *, within: float = 2.0) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < within
+    except OSError:
+        return False
+
+
 @contextmanager
 def op_lock(path: Path, *, op: str, op_id: str, timeout: float = 120.0):
     """互斥执行 start/stop/restart 等操作。失效的锁会被接管。"""
@@ -68,6 +77,9 @@ def op_lock(path: Path, *, op: str, op_id: str, timeout: float = 120.0):
             break
         except FileExistsError:
             holder = lock_holder(path)
+            if holder is None and attempt == 1 and read_json(path) is None and _just_created(path):
+                # 对方刚用 O_EXCL 建出锁文件、内容还没写进去：这是一把有效的锁，不能当成失效锁接管
+                holder = {"op": "刚开始的操作", "op_id": "?"}
             if holder or attempt == 2:
                 raise NorainError(
                     f"另一个操作正在进行：{(holder or {}).get('op', '未知')}"

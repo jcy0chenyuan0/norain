@@ -30,7 +30,8 @@ class Client:
         self.port = free_port()
         self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("NORAIN_", "FAKE_SB_"))},
                     "NORAIN_HOME": str(self.home), "NORAIN_STATE": str(self.state),
-                    "NORAIN_SINGBOX": str(FAKE), "PYTHONPATH": str(ROOT / "src")}
+                    "NORAIN_SINGBOX": str(FAKE), "PYTHONPATH": str(ROOT / "src"),
+                    "NORAIN_NO_SYSTEM_CHANGES": "1"}
         self.write()
 
     # 生命周期测试要离线可跑：关掉监控、看门狗、分流学习和规则集（它们会访问真实网络）

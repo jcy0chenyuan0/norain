@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import sys
 import time
@@ -44,7 +45,8 @@ def tail(path: Path, *, lines: int, follow: bool) -> int:
         raise NorainError(f"还没有日志：{path}", module="log")
     f = path.open("r", encoding="utf-8", errors="replace")
     try:
-        sys.stdout.writelines(f.readlines()[-lines:])
+        # 只保留最后 lines 行，不把整个日志（可达几十 MB）读进内存；-n 0 不输出历史
+        sys.stdout.writelines(collections.deque(f, maxlen=max(lines, 0)))
         sys.stdout.flush()
         while follow:
             line = f.readline()
