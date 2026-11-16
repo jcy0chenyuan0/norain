@@ -99,11 +99,15 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   浏览器实测 claude.ai 正常打开（已登录）；`api.anthropic.com` 返回 401（可达）
 - 注意：用 `curl` 直测 `claude.ai` 会得到 403（Cloudflare 按 UA/TLS 指纹拦命令行客户端），
   这不代表出口被封，判断要按浏览器或 API 的实测结果
+- `fix`、`update`、`reload` 均实测：fix 重建配置后服务保持 active；update 备份→复用现有二进制→
+  校验→重注册自启动→重启，服务恢复后客户端请求 200、出口 IP 正确
 
 **仍未验证**
 
-- Linux 侧除本次服务端部署外的部分（nftables、`fix`、`update`）
-- 真实 ACME 签发（需要公网 80/tcp）
+- **nftables 后端**：它只存在于客户端 Linux 的阻断模块（服务端防火墙只有 ufw / firewalld / netsh），
+  当前验证机是 Windows，无法验证；需要一台 Linux 客户端
+- **真实 ACME 签发**：需要“能解析到本机 + 公网 80/tcp 可达”的域名；当前服务端是 IP + 自签证书，
+  只能验证生成的结构（已过 `sing-box check`），拿不到真实证书
 - 真实 ACME 签发（需要公网 80/tcp）
 - 监控错误码在真实环境下的触发与防抖
 - 自维持模块与看门狗互拉、修复四级
