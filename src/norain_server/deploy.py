@@ -180,6 +180,35 @@ def _write_unit(paths: Paths) -> None:
     os.chmod(env_file, 0o640)
 
 
+def _venv_package() -> str:
+    return f"python3.{sys.version_info.minor}-venv"
+
+
+def _ensure_prereqs(steps: list[str], warnings: list[str]) -> None:
+    """补齐运行 norain-server 需要的前置条件（Linux）。
+
+    安装器本身已经是 Python 程序，所以“装 Python 本身”由引导脚本 scripts/bootstrap-server.sh 做；
+    这里补的是 venv 模块和 pip——Debian/Ubuntu 上要单独装（python3.X-venv / python3-pip），
+    否则给服务建虚拟环境、装依赖都会失败。只在有 apt-get 且是 root 时自动装，其余发行版给出命令。
+    """
+    if osutil.IS_WINDOWS or not shutil.which("systemctl"):
+        return
+    missing: list[str] = []
+    if osutil.run([sys.executable, "-c", "import venv"]).returncode != 0:
+        missing.append(_venv_package())
+    if osutil.run([sys.executable, "-m", "pip", "--version"]).returncode != 0:
+        missing.append("python3-pip")
+    if not missing:
+        return
+    if shutil.which("apt-get") and osutil.is_admin():
+        for pkg in missing:
+            osutil.run_checked(["apt-get", "install", "-y", "-q", pkg],
+                               what=f"安装前置依赖 {pkg}", module="deploy")
+            steps.append(f"前置依赖：已安装 {pkg}")
+        return
+    warnings.append("缺少前置依赖：" + "、".join(missing) + "；请手动安装后重试")
+
+
 def register_autostart(paths: Paths) -> str:
     if osutil.IS_WINDOWS:
         cmd = osutil.quote_cmd([sys.executable, "-m", "norain_server", "run", "--if-desired"])
@@ -250,6 +279,7 @@ def install(paths: Paths, *, force: bool = False, archive: Path | None = None,
     warnings: list[str] = []
     fresh_state = not paths.state.exists()
     try:
+        _ensure_prereqs(steps, warnings)
         # 1. 目录和服务用户
         _ensure_user(undo)
         _ensure_dirs(paths)

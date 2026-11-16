@@ -29,6 +29,14 @@ norain uninstall
 
 ## 服务端
 
+干净机器上可以直接用引导脚本（系统依赖 → 虚拟环境 → 安装包 → `norain-server install`）：
+
+```bash
+sudo ./scripts/bootstrap-server.sh
+```
+
+已经装好 Python 与 venv 时，照常手动安装：
+
 ```bash
 NORAIN_DOMAIN=example.com NORAIN_PASSWORD=… norain-server install
 norain-server start | stop | restart | reload | status

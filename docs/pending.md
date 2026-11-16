@@ -123,8 +123,10 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   :80（HTTP-01），或监听 :443 做 TLS-ALPN-01——后者只在 trojan 启用且端口为 443 时才保留。
   所以：独占 80/443 的机器可直接用 acme；与网站共存（80 被占、trojan 关）时必须改用
   `tls.mode = "manual"` + 外部续期（如 certbot），否则续期会静默失败
-- 部署前置：`norain-server install` 不负责装 Python/venv/依赖，目标机需先有 Python ≥3.11、
-  `python3-<ver>-venv`（Debian/Ubuntu 要额外 apt 装）和可用的 pip；否则第一步就失败
+- 部署前置（已改为安装器负责）：`norain-server install` 会检查并补齐 `venv` 模块与 pip
+  （有 apt-get 且是 root 时自动 `apt-get install`，其它发行版给出手动命令）；
+  Python 本身由 `scripts/bootstrap-server.sh` 负责（系统依赖 → venv → 包 → install），
+  该脚本已完成语法检查，尚未在全新机器上端到端执行
 - 监控错误码在真实环境下的触发与防抖
 - 自维持模块与看门狗互拉、修复四级
 - 分流学习「试连 → 改判」闭环：`_CONN` 已对真实日志验证匹配，`_ERR` 尚未在真实日志中出现
