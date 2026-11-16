@@ -101,11 +101,14 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   这不代表出口被封，判断要按浏览器或 API 的实测结果
 - `fix`、`update`、`reload` 均实测：fix 重建配置后服务保持 active；update 备份→复用现有二进制→
   校验→重注册自启动→重启，服务恢复后客户端请求 200、出口 IP 正确
+- 客户端 `NftBackend`（Linux 阻断）在真实 `nft` 上实测通过，见「仍未验证」里的说明
 
 **仍未验证**
 
-- **nftables 后端**：它只存在于客户端 Linux 的阻断模块（服务端防火墙只有 ufw / firewalld / netsh），
-  当前验证机是 Windows，无法验证；需要一台 Linux 客户端
+- ~~nftables 后端~~：2026-11-16 在服务器的 Linux（Ubuntu 24.04，真实 `nft`）上直接运行客户端的
+  `NftBackend` 验证通过——建出 `inet norain_block`（output policy drop）、非白名单目标被阻断
+  （1.1.1.1 → 000）、SSH 因白名单放行而保持连接、`release` 后表被删除、网络恢复（301）。
+  放行清单含基础段 + 局域网 + 代理服务器 + 国内 DNS + 监控国内目标，属设计内行为
 - **真实 ACME 签发**：需要“能解析到本机 + 公网 80/tcp 可达”的域名；当前服务端是 IP + 自签证书，
   只能验证生成的结构（已过 `sing-box check`），拿不到真实证书
 - 真实 ACME 签发（需要公网 80/tcp）
