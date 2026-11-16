@@ -118,11 +118,17 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   `NftBackend` 验证通过——建出 `inet norain_block`（output policy drop）、非白名单目标被阻断
   （1.1.1.1 → 000）、SSH 因白名单放行而保持连接、`release` 后表被删除、网络恢复（301）。
   放行清单含基础段 + 局域网 + 代理服务器 + 国内 DNS + 监控国内目标，属设计内行为
-- ~~真实 ACME 签发~~：2026-11-16 在 abyssrain.top 上验证通过（见上文），续期仍待时间验证
-- 真实 ACME 签发（需要公网 80/tcp）
+- ~~真实 ACME 签发~~：2026-11-16 在 abyssrain.top 上验证通过（见上文）；**续期**仍待时间验证
 - 监控错误码在真实环境下的触发与防抖
 - 自维持模块与看门狗互拉、修复四级
 - 分流学习「试连 → 改判」闭环：`_CONN` 已对真实日志验证匹配，`_ERR` 尚未在真实日志中出现
-- `install` 的 `setx` / PATH / 开机自启写用户环境（未动）
+- **客户端 `install`**（Windows）：`setx` / PATH / 启动器 / `%APPDATA%\norain\cfg.toml` 生成 /
+  开机自启注册（`Norain` 计划任务）整条链路从未执行；服务端的同一套（systemd、环境文件）已在 Linux 上验过
+- **客户端 `uninstall`**：依赖 `install`，同样没跑过
+- TUN 的**实际流量**：只验证了接口建立、默认路由接管与退出还原，没有验证 DNS 与应用流量真的经 TUN 出去
+- 阻断的**弹窗**路径（自检时用了 `notify=False`）与开机时自动解除阻断（`pre_start`）的真实场景
+- 服务端 **Windows**（netsh / schtasks / setx）与 systemd 下的**崩溃循环**（restart_limit/backoff 真实触发）
+- 服务端 `fix` 只测过正常状态，损坏配置/丢失证书等异常状态未测
+- 服务端 trojan 与 nginx 共存（abyssrain 上只启用了 hysteria2；trojan 在 IP+自签环境验过）
 - 客户端 `auto` 双协议：现有环境的 hysteria2 与 trojan **口令不同**，而配置模型只有一个
   `credential_ref`，因此实测只用单协议 hysteria2；双协议需要按协议分别配置口令（待设计）
