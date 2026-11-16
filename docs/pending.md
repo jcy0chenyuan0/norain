@@ -108,6 +108,8 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
 - **与 nginx 共存**：Hysteria2 用 UDP 443、nginx 继续占 TCP 80/443
 - **开机自启动经真实重启验证**：`systemctl reboot` 后 `norain-server` 与 `nginx` 均 active，
   网站 200、代理 google 200 全部恢复
+- 验证完成后已用 `norain-server uninstall --purge` 卸载（那台机器是网站服务器，保留 nginx）；
+  这一节记录的是验证结论，不代表仍在部署
 - 客户端 `NftBackend`（Linux 阻断）在真实 `nft` 上实测通过，见「仍未验证」里的说明
 
 **仍未验证**
