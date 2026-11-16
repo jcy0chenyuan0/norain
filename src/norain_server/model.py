@@ -88,6 +88,23 @@ class Logging(_Strict):
     retain_files: int = Field(5, ge=1, le=100)
 
 
+WARP_DOMAINS = ["claude.ai", "claude.com", "anthropic.com", "anthropic.ai",
+                "claudeusercontent.com", "cla.st"]
+
+
+class Warp(_Strict):
+    """把指定域名从本机 WARP（Cloudflare Zero Trust Client 的 socks5）出去。
+
+    原来的服务端就是这么干的（claude/anthropic 走 WARP，其余直连）；不配就不产生路由规则。
+    """
+    address: str = "127.0.0.1:40000"
+    domains: list[str] = Field(default_factory=lambda: list(WARP_DOMAINS))
+
+
+class Routing(_Strict):
+    warp: Warp | None = None
+
+
 class ServerConfig(_Strict):
     _config_warnings: list[str] = PrivateAttr(default_factory=list)
     schema_version: int = Field(SCHEMA_VERSION, alias="schema")
@@ -95,6 +112,7 @@ class ServerConfig(_Strict):
     protocols: Protocols = Protocols()
     auth: Auth = Auth()
     tls: Tls = Tls()
+    routing: Routing = Routing()
     service: Service = Service()
     logging: Logging = Logging()
 
@@ -208,6 +226,13 @@ def _cross_checks(cfg: ServerConfig) -> list[FieldError]:
         for name in ("certificate", "private_key"):
             if not getattr(cfg.tls, name):
                 errs.append(FieldError(f"tls.{name}", "manual 模式下必须填写路径"))
+    warp = cfg.routing.warp
+    if warp is not None:
+        host, _, port = warp.address.rpartition(":")
+        if not host or not port.isdigit() or not 0 < int(port) < 65536:
+            errs.append(FieldError("routing.warp.address", "必须是 host:port 形式，例如 127.0.0.1:40000"))
+        if not warp.domains:
+            errs.append(FieldError("routing.warp.domains", "至少写一个要走 WARP 的域名"))
     return errs
 
 

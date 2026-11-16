@@ -30,6 +30,12 @@ private_key = "/etc/norain-server/tls/privkey.pem"
 # 然后把 mode 改为 "self-signed"，并删除上面两行
 # acme：需要域名，且 80/tcp 能从公网访问（HTTP-01）；删除上面两行，可选填 email = "you@example.com"
 
+# 可选：本机 WARP 分流。配了以后这些域名从 Cloudflare Zero Trust Client 的 socks5 出去，
+# 其余仍然直连（原来的服务端就是这么把 claude/anthropic 送出去的）。
+# [routing.warp]
+# address = "127.0.0.1:40000"
+# domains = ["claude.ai", "claude.com", "anthropic.com", "anthropic.ai", "claudeusercontent.com", "cla.st"]
+
 [service]
 check_interval_seconds = 30   # 健康检查间隔
 restart_limit = 3             # sing-box 连续重启上限

@@ -116,6 +116,30 @@ def test_generated_json_shape(server):
     assert doc["route"] == {"final": "direct"}
 
 
+def test_warp_routing_is_optional_and_generated(server):
+    # 默认不带 WARP：只有 direct 出站，没有路由规则
+    doc = generate.build(load_config(server.config, env={}), PASSWORD,
+                         server.state / "c.crt", server.state / "c.key")
+    assert doc["outbounds"] == [{"type": "direct", "tag": "direct"}]
+    assert "rules" not in doc["route"]
+
+    server.write_config(extra='[routing.warp]\naddress = "127.0.0.1:40000"\n'
+                              'domains = ["claude.ai", "claude.com"]\n')
+    cfg = load_config(server.config, env={})
+    assert cfg.routing.warp.address == "127.0.0.1:40000"
+    doc = generate.build(cfg, PASSWORD, server.state / "c.crt", server.state / "c.key")
+    assert doc["outbounds"][0] == {"type": "socks", "tag": "warp",
+                                   "server": "127.0.0.1", "server_port": 40000}
+    assert doc["route"]["rules"] == [{"domain_suffix": ["claude.ai", "claude.com"], "outbound": "warp"}]
+    assert doc["route"]["final"] == "direct"
+
+
+def test_warp_address_is_validated(server):
+    server.write_config(extra='[routing.warp]\naddress = "nope"\ndomains = ["a.test"]\n')
+    errs = errors_of(server)
+    assert "routing.warp.address" in errs
+
+
 def test_single_protocol_and_fallback(server):
     server.write_config(extra="")
     text = server.config.read_text().replace(

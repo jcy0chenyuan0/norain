@@ -64,11 +64,17 @@ class ProtoPort(_Strict):
 
 
 class Multiplex(_Strict):
-    """trojan 的多路复用。默认值与原来那套代理一致（smux / 8 条流）。
+    """trojan 的多路复用，**默认关闭**。
+
+    sing-box 1.7 起客户端 mux 走 sp.mux.sing-box.arpa，服务端必须在**入站**上显式开启
+    multiplex 才接受。原来那套服务端（同样是 1.14.4）没有开，2026-11-15 实测：客户端开
+    mux 时 trojan 立刻失败（HTTP 000，服务端日志 "global multiplex is deprecated …
+    enable multiplex in Inbound fields instead"），关掉立刻通（200）。
+    只有自建服务端的入站也开了 multiplex 时才值得打开。
 
     hysteria2 不走这里：它是 QUIC 上的原生协议，sing-box 不支持也不需要对它多路复用。
     """
-    enabled: bool = True
+    enabled: bool = False
     protocol: Literal["smux", "yamux", "h2mux"] = "smux"
     max_streams: int = Field(8, ge=1, le=128)
 

@@ -76,11 +76,20 @@ def build(cfg: ServerConfig, password: str, cert: Path, key: Path, *,
         if fb:
             inbound["fallback"] = {"server": fb.host, "server_port": fb.port}
         inbounds.append(inbound)
-    doc = {
+    outbounds: list[dict] = [{"type": "direct", "tag": "direct"}]
+    route_rules: list[dict] = []
+    warp = cfg.routing.warp
+    if warp is not None and warp.domains:
+        # 与原来的服务端一致：这些域名从本机 WARP 出去，其余直连
+        host, _, port = warp.address.rpartition(":")
+        outbounds.insert(0, {"type": "socks", "tag": "warp", "server": host, "server_port": int(port)})
+        route_rules.append({"domain_suffix": [d.strip().lower() for d in warp.domains],
+                            "outbound": "warp"})
+    doc: dict = {
         "log": {"level": cfg.logging.level, "timestamp": True},
         "inbounds": inbounds,
-        "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final": "direct"},  # 服务端不做分流
+        "outbounds": outbounds,
+        "route": {"final": "direct", **({"rules": route_rules} if route_rules else {})},
     }
     if acme:
         doc["certificate_providers"] = [acme_provider(cfg, acme_dir or Path("acme"))]

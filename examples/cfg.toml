@@ -27,9 +27,10 @@ port = 443
 
 [proxy.trojan]
 port = 443
-# 多路复用：与原来那套代理一致（smux / 8 条流）。hysteria2 不需要也不能配这个。
+# 多路复用：默认关闭。sing-box 1.7+ 的服务端必须在入站上显式开启 multiplex 才接受，
+# 原来那套服务端没开，开了这条客户端 mux 会让 trojan 直接连不上（见 model.Multiplex）。
 [proxy.trojan.multiplex]
-enabled = true
+enabled = false
 protocol = "smux"             # smux | yamux | h2mux
 max_streams = 8
 

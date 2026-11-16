@@ -65,7 +65,7 @@ def test_default_config_values_are_valid_toml():
     assert server_doc["tls"]["email"] == 'a"b@example.test'
 
 
-def test_default_lists_and_trojan_multiplex_come_from_the_existing_proxy():
+def test_default_lists_come_from_the_existing_proxy():
     from norain import defaults, generate, model
 
     text = client_install.default_config_text(
@@ -83,7 +83,9 @@ def test_default_lists_and_trojan_multiplex_come_from_the_existing_proxy():
 
     built = generate.build(model.parse(doc), password="x", rules={})
     trojan = next(o for o in built["outbounds"] if o["type"] == "trojan")
-    assert trojan["multiplex"] == {"enabled": True, "protocol": "smux", "max_streams": 8}
+    # 原配置里客户端开了 smux，但服务端入站没开，mux 会让 trojan 连不上（2026-11-15 实测），
+    # 所以默认不再往配置里写 multiplex。
+    assert "multiplex" not in trojan
 
 
 def test_default_server_config_rejects_non_numeric_port():

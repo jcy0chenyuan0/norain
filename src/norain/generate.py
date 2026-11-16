@@ -99,7 +99,7 @@ def _outbound(cfg: ClientConfig, protocol: str, password: str, tag: str) -> dict
         tls["insecure"] = True
     out: dict = {"type": protocol, "tag": tag, "server": p.server, "server_port": p.port_of(protocol),
                  "password": password, "tls": tls}
-    if protocol == "trojan" and p.trojan.multiplex.enabled:  # 与原来那套代理一致：smux / 8
+    if protocol == "trojan" and p.trojan.multiplex.enabled:  # 服务端入站开了 multiplex 才可用
         m = p.trojan.multiplex
         out["multiplex"] = {"enabled": True, "protocol": m.protocol, "max_streams": m.max_streams}
     return out

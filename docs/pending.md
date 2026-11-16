@@ -86,9 +86,24 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
    `terminate()`（Windows 上即硬杀）。已在客户端侧加注册表快照/还原（`norain_core/sysproxy.py`），
    快照落盘、强杀后下次启动先还原。(已修 + 回归测试)
 
+**服务端真实部署（2026-11-16）**
+
+- Ubuntu + Python 3.12 venv 安装 `norain-server`，接管 443：Hysteria2（UDP）+ Trojan（TCP）同时服务；
+  systemd 单元、防火墙放行、启动测试全部通过
+- 原有的 proxy-suite 客户端直接连新服务端：google 200、出口 IP 正确（trojan 与 hysteria2 都验证过）
+- 客户端 trojan 多路复用默认关闭：sing-box 1.7+ 要求服务端**入站**开启 multiplex，
+  原来那套服务端没开，实测开 mux 时 trojan 立刻失败（000），关闭后正常（200）
+- 新增 `[routing.warp]`：指定域名走本机 socks5（Cloudflare WARP），其余直连，
+  与旧服务端的 hysteria `acl` 一致（claude.ai / claude.com / anthropic.com / claudeusercontent.com → warp）。
+  部署后日志确认 `outbound/socks[warp]: outbound connection to claude.ai:443`，
+  浏览器实测 claude.ai 正常打开（已登录）；`api.anthropic.com` 返回 401（可达）
+- 注意：用 `curl` 直测 `claude.ai` 会得到 403（Cloudflare 按 UA/TLS 指纹拦命令行客户端），
+  这不代表出口被封，判断要按浏览器或 API 的实测结果
+
 **仍未验证**
 
-- Linux 侧全部（systemd、nftables、`deploy.py`）
+- Linux 侧除本次服务端部署外的部分（nftables、`fix`、`update`）
+- 真实 ACME 签发（需要公网 80/tcp）
 - 真实 ACME 签发（需要公网 80/tcp）
 - 监控错误码在真实环境下的触发与防抖
 - 自维持模块与看门狗互拉、修复四级
