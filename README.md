@@ -1,7 +1,19 @@
 # Norain
 
+[![PyPI](https://img.shields.io/pypi/v/norain.svg)](https://pypi.org/project/norain/)
+[![Python](https://img.shields.io/pypi/pyversions/norain.svg)](https://pypi.org/project/norain/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 基于 sing-box 的 Hysteria2 / Trojan 代理：客户端 `norain` 和服务端 `norain-server`，Python 做控制层，
 sing-box 做数据面，兼容 Windows 和 Linux。
+
+## 安装
+
+```bash
+pip install --pre norain      # 0.2.0.dev0 是预发布版本，需要 --pre
+```
+
+同一个包提供两个命令：`norain`（客户端）和 `norain-server`（服务端）。
 
 **当前状态：0.2.0.dev0 预发布。两端模块代码齐备；测试套件在 Windows 上 95 项通过（3 项仅 POSIX 跳过）。
 已在真实环境验证过的部分**：生成配置通过真实 `sing-box 1.14.4 check`、本地端到端隧道、TUN 路由接管与还原、
