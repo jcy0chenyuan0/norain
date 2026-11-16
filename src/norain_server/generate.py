@@ -48,7 +48,7 @@ def acme_provider(cfg: ServerConfig, acme_dir: Path) -> dict:
 
 def build(cfg: ServerConfig, password: str, cert: Path, key: Path, *,
           acme_dir: Path | None = None) -> dict:
-    """生成 sing-box 1.14 配置。字段依据官方文档，尚未经真实 sing-box check 验证。"""
+    """生成 sing-box 1.14 配置。已用真实 sing-box 1.14.4 check 验证 5 种组合。"""
     acme = cfg.tls.mode == "acme"
 
     def tls(**extra) -> dict:

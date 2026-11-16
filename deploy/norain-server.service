@@ -8,7 +8,7 @@
 #
 # 职责（docs/decisions/0012 修订）：Python 守护负责重启 sing-box（上限见 server.toml 的
 # restart_limit）；systemd 只在守护进程自身异常退出时把它拉起。
-# 本单元尚未在真实系统上验证。
+# 已实测：install/update 生成的等价单元在 Ubuntu 上启用，并通过真实重启验证开机自启。
 
 [Unit]
 Description=Norain server (sing-box supervisor)

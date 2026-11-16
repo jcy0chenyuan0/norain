@@ -1,7 +1,7 @@
 """cfg.toml → sing-box JSON：代理模块和分流模块的数据面配置。
 
 字段依据 sing-box 1.14 官方文档（不使用 1.14 已弃用的字段：DNS 规则的 strategy、
-independent_cache、TUN 的 stack 等），尚未经真实 sing-box check 验证。
+independent_cache、TUN 的 stack 等）；生成的客户端配置已用真实 sing-box 1.14.4 check 验证。
 
 结构：
   入站  mixed-in（本地代理）、tun-in（traffic_mode = tun）、

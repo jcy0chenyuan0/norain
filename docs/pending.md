@@ -101,9 +101,9 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   这不代表出口被封，判断要按浏览器或 API 的实测结果
 - `fix`、`update`、`reload` 均实测：fix 重建配置后服务保持 active；update 备份→复用现有二进制→
   校验→重注册自启动→重启，服务恢复后客户端请求 200、出口 IP 正确
-- **abyssrain.top 真实部署（2026-11-16）**：`norain-server install` 自动下载并校验 sing-box 1.14.4、
+- **真实部署（2026-11-16，独立服务器，域名/IP 已脱敏）**：`norain-server install` 自动下载并校验 sing-box 1.14.4、
   生成配置、注册 systemd、放行 443/udp 与 80/tcp、启动测试通过
-- **真实 ACME 签发成功**：Let's Encrypt 为 abyssrain.top 签发证书（日志 `certificate obtained successfully`），
+- **真实 ACME 签发成功**：Let's Encrypt 为真实域名签发证书（日志 `certificate obtained successfully`），
   客户端用 `insecure = false` 做真实证书校验即可连通（google 200，出口 IP = 服务器 IP）
 - **与 nginx 共存**：Hysteria2 用 UDP 443、nginx 继续占 TCP 80/443
 - **开机自启动经真实重启验证**：`systemctl reboot` 后 `norain-server` 与 `nginx` 均 active，
@@ -118,7 +118,7 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   `NftBackend` 验证通过——建出 `inet norain_block`（output policy drop）、非白名单目标被阻断
   （1.1.1.1 → 000）、SSH 因白名单放行而保持连接、`release` 后表被删除、网络恢复（301）。
   放行清单含基础段 + 局域网 + 代理服务器 + 国内 DNS + 监控国内目标，属设计内行为
-- ~~真实 ACME 签发~~：2026-11-16 在 abyssrain.top 上验证通过（见上文）；**续期**仍待时间验证
+- ~~真实 ACME 签发~~：2026-11-16 在真实域名上验证通过（见上文）；**续期**仍待时间验证
 - ACME 的**端口前提**（重要，写进部署文档前要记住）：sing-box 的 ACME 签发/续期要自己监听
   :80（HTTP-01），或监听 :443 做 TLS-ALPN-01——后者只在 trojan 启用且端口为 443 时才保留。
   所以：独占 80/443 的机器可直接用 acme；与网站共存（80 被占、trojan 关）时必须改用
@@ -137,6 +137,6 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
 - 阻断的**弹窗**路径（自检时用了 `notify=False`）与开机时自动解除阻断（`pre_start`）的真实场景
 - 服务端 **Windows**（netsh / schtasks / setx）与 systemd 下的**崩溃循环**（restart_limit/backoff 真实触发）
 - 服务端 `fix` 只测过正常状态，损坏配置/丢失证书等异常状态未测
-- 服务端 trojan 与 nginx 共存（abyssrain 上只启用了 hysteria2；trojan 在 IP+自签环境验过）
+- 服务端 trojan 与 nginx 共存（共存部署里只启用了 hysteria2；trojan 在 IP+自签环境验过）
 - 客户端 `auto` 双协议：现有环境的 hysteria2 与 trojan **口令不同**，而配置模型只有一个
   `credential_ref`，因此实测只用单协议 hysteria2；双协议需要按协议分别配置口令（待设计）

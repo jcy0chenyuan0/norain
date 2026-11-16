@@ -6,7 +6,7 @@ Windows：sing-box.exe 装到 %ProgramFiles%\\norain-server，配置在 %Program
 用开机计划任务自启，用 setx 写环境变量。
 
 所有步骤幂等；重复安装不覆盖已有用户配置（除非 --force）；安装失败按相反顺序回滚。
-本模块尚未在真实系统上验证。
+已在真实 Ubuntu 上验证：install / reload / fix / update / uninstall，以及 systemd 开机自启（含真实重启）。
 """
 
 from __future__ import annotations

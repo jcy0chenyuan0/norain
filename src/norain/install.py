@@ -5,7 +5,8 @@ install：sing-box → 默认配置 → 安装包副本和哈希清单（修复�
 uninstall：停止全部进程、解除阻断、删除自启动项、环境变量、PATH、启动器和全部文件。
            它同时是「重载修复」的前半段，也是一条独立的命令。
 
-Python 包本身由包管理器安装（pip），卸载命令不删除它。本模块尚未在真实系统上验证。
+Python 包本身由包管理器安装（pip），卸载命令不删除它。客户端 install 尚未在真实系统上执行过
+（服务端同一套流程已在 Linux 上验证）。
 """
 
 from __future__ import annotations

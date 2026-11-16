@@ -1,7 +1,6 @@
 """sing-box 二进制定位、版本检查和 check 包装。锁定策略见 docs/decisions/0002。
 
-注意：`sing-box version` 的输出格式和 `check` 的行为是按官方文档推定的，
-尚未用真实二进制验证（见 docs/reports/phase-1.md「未验证项目」）。
+已用真实 sing-box 1.14.4 验证：版本探测、check 校验、rule-set match。
 """
 
 from __future__ import annotations

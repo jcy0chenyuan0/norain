@@ -3,9 +3,11 @@
 基于 sing-box 的 Hysteria2 / Trojan 代理：客户端 `norain` 和服务端 `norain-server`，Python 做控制层，
 sing-box 做数据面，兼容 Windows 和 Linux。
 
-**当前状态：最初目标里两端的全部模块代码已写完，但还没有在真实环境里验证过——没有跑过测试，
-没有用过真实的 sing-box，没有在任何系统上执行过安装、防火墙或阻断命令。** 详见
-[HANDOFF.md](HANDOFF.md) 和 [docs/pending.md](docs/pending.md)。
+**当前状态：0.2.0.dev0 预发布。两端模块代码齐备；测试套件在 Windows 上 95 项通过（3 项仅 POSIX 跳过）。
+已在真实环境验证过的部分**：生成配置通过真实 `sing-box 1.14.4 check`、本地端到端隧道、TUN 路由接管与还原、
+Windows 防火墙阻断与解除、nftables 阻断、系统代理写入与还原、服务端 install/reload/fix/update/uninstall、
+systemd 开机自启（真实重启）、真实 ACME 签发。**仍未验证**：客户端与 Linux 的安装流程、TUN 的实际流量、
+监控错误码、自维持互拉、分流学习闭环。逐项见 [docs/pending.md](docs/pending.md)。
 
 优先级：以最初目标 [docs/reference/original-goals.md](docs/reference/original-goals.md) 为准，除非有硬性 bug。
 

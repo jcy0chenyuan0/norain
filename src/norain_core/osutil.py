@@ -1,7 +1,8 @@
 """系统适配：管理员判断、外部命令、后台进程、持久环境变量、PATH、启动器、弹窗、计划任务。
 
 Windows 与 Linux 的差异都收在这里，上层模块不直接拼系统命令。
-本模块里的系统命令均按官方文档书写，尚未在真实系统上验证。
+已实测：Windows 计划任务（schtasks 增删查）、systemd（服务端 install/update）、apt 安装前置依赖。
+其余命令按官方文档书写，未逐一实测。
 """
 
 from __future__ import annotations

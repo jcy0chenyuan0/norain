@@ -5,7 +5,7 @@
 `<state>/firewall.json` 里，用户原有的同端口规则不会被动到。
 
 后端：Linux 优先 ufw，其次 firewalld，都没有时提示手动放行；Windows 用 netsh advfirewall。
-各后端的命令按官方文档书写，尚未在真实系统上验证。
+ufw 后端已实测（install 放行端口、uninstall 撤回规则）；firewalld 与 netsh 未实测。
 """
 
 from __future__ import annotations
