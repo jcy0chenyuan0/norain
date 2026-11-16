@@ -101,6 +101,13 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   这不代表出口被封，判断要按浏览器或 API 的实测结果
 - `fix`、`update`、`reload` 均实测：fix 重建配置后服务保持 active；update 备份→复用现有二进制→
   校验→重注册自启动→重启，服务恢复后客户端请求 200、出口 IP 正确
+- **abyssrain.top 真实部署（2026-11-16）**：`norain-server install` 自动下载并校验 sing-box 1.14.4、
+  生成配置、注册 systemd、放行 443/udp 与 80/tcp、启动测试通过
+- **真实 ACME 签发成功**：Let's Encrypt 为 abyssrain.top 签发证书（日志 `certificate obtained successfully`），
+  客户端用 `insecure = false` 做真实证书校验即可连通（google 200，出口 IP = 服务器 IP）
+- **与 nginx 共存**：Hysteria2 用 UDP 443、nginx 继续占 TCP 80/443
+- **开机自启动经真实重启验证**：`systemctl reboot` 后 `norain-server` 与 `nginx` 均 active，
+  网站 200、代理 google 200 全部恢复
 - 客户端 `NftBackend`（Linux 阻断）在真实 `nft` 上实测通过，见「仍未验证」里的说明
 
 **仍未验证**
@@ -109,8 +116,7 @@ Linux 侧、真实 ACME、监控错误码、自维持互拉仍未验证。
   `NftBackend` 验证通过——建出 `inet norain_block`（output policy drop）、非白名单目标被阻断
   （1.1.1.1 → 000）、SSH 因白名单放行而保持连接、`release` 后表被删除、网络恢复（301）。
   放行清单含基础段 + 局域网 + 代理服务器 + 国内 DNS + 监控国内目标，属设计内行为
-- **真实 ACME 签发**：需要“能解析到本机 + 公网 80/tcp 可达”的域名；当前服务端是 IP + 自签证书，
-  只能验证生成的结构（已过 `sing-box check`），拿不到真实证书
+- ~~真实 ACME 签发~~：2026-11-16 在 abyssrain.top 上验证通过（见上文），续期仍待时间验证
 - 真实 ACME 签发（需要公网 80/tcp）
 - 监控错误码在真实环境下的触发与防抖
 - 自维持模块与看门狗互拉、修复四级
