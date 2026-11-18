@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "norain"
-version = "0.2.1"
+version = "0.2.2"
 description = "Norain：基于 sing-box 的 Hysteria2/Trojan 客户端与服务端控制层"
 requires-python = ">=3.11"
 readme = "README.md"
