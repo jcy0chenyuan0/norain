@@ -102,6 +102,9 @@ domestic = "223.5.5.5"
 proxy = "https://1.1.1.1/dns-query"
 strategy = "prefer_ipv4"
 cache_ttl_seconds = 300       # 分流模块学到的解析结果保留多久
+fake_ip = false               # TUN 下让服务端拿到域名：只对走代理的域名返回假 IP（见 ADR 0006）
+fake_ip_range = "198.18.0.0/15"
+fake_ip_range_v6 = ""         # 需要 IPv6 fake-ip 时填，例如 "fc00::/18"
 
 [monitor]
 enabled = true

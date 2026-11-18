@@ -46,3 +46,31 @@ sing-box 1.12 重构了 DNS server 格式，旧格式在 1.14 已移除。1.14 �
 ## 确认
 
 （空）
+
+## 修订
+
+2026-11-18：**TUN 模式下增加 fake-ip（`dns.fake_ip`，默认关闭）**
+
+起因：Claude Desktop 走 TUN 时，服务端收不到域名，`routing.warp` 的 `domain_suffix` 匹配不到，
+流量落到 `final = direct`，出口是机房 IP，被 Cloudflare 挑战；改用 mixed 入站则正常。
+
+根因是 sing-box 1.13 移除了 `sniff_override_destination`（`inbound.sniff` /
+`sniff_override_destination` 也在 1.13.0 移除）。`route` 里的 `sniff` 动作只填充
+`metadata.Domain` 供规则匹配，**不会**把转发的目标地址从 IP 换成域名，所以经混合入站
+（应用自带域名）不受影响，TUN（只有 IP）就丢了域名。已用 sing-box 1.14.4 实测确认这两种
+旧写法都会 FATAL。
+
+上游给的替代方案是 fake-ip（[#2407](https://github.com/SagerNet/sing-box/issues/2407)）。
+实现要点：
+
+- fake-ip 的 DNS server 与 DNS 规则**只覆盖走代理的域名**（`proxy_domains` 与学到的代理名单）。
+  直连域名和未知域名必须返回真 IP，否则应用拿到 `198.18.x.x` 既连不上、也破坏直连判定。
+- DNS 规则里 fakeip 必须排在 `dns-direct` 之前，否则先被直连规则吃掉。
+- `route.rules` 里为 fake-ip 段加一条 `{"ip_cidr": [...], "action": "sniff"}`，
+  让它先嗅探、再按域名分流，避免被后面的 `ip_cidr` 规则当成普通 IP。
+- 只在 `traffic_mode = "tun"` 时生效：mixed / system-proxy 本来就能把域名交给服务端。
+- `fake_ip_range_v6` 默认空（不启用 IPv6 fake-ip）；需要时显式配置 `inet6_range`。
+
+副作用（需要知情）：fake-ip 会改变应用看到的 IP，某些按 IP 判断的逻辑（例如把连接钉死在
+某个 IP 上的客户端）可能受影响，所以**默认关闭**，按需开启。服务端侧的兜底见 ADR 0008 与
+`routing.warp.ip_cidr`（纯 IP 场景不依赖 fake-ip 也能命中 WARP）。

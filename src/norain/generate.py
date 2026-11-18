@@ -130,6 +130,14 @@ def _domain_match(entries: list[str]) -> dict:
     return m
 
 
+def _fakeip_servers(cfg: ClientConfig) -> list[dict]:
+    """fake-ip 的 server 定义。只包含让哪些查询走假 IP 所需的那一个 server。"""
+    srv: dict = {"type": "fakeip", "tag": "dns-fakeip", "inet4_range": cfg.dns.fake_ip_range}
+    if cfg.dns.fake_ip_range_v6:
+        srv["inet6_range"] = cfg.dns.fake_ip_range_v6
+    return [srv]
+
+
 def _dns(cfg: ClientConfig, learned: dict, geosite_tags: list[str], strategy: str) -> tuple[dict, str]:
     """返回 (dns 配置, 默认域名解析器的标签)。"""
     if cfg.dns.mode == "local":
@@ -153,6 +161,16 @@ def _dns(cfg: ClientConfig, learned: dict, geosite_tags: list[str], strategy: st
         m = _domain_match(entries)
         if m:
             rules.append({**m, "action": "route", "server": server})
+
+    # fake-ip：只对「走代理」的域名返回假 IP。
+    # 直连域名和未知域名必须给真 IP，否则应用拿到的 198.18.x.x 既连不上、也破坏直连判定。
+    # 规则顺序上 fakeip 必须排在 dns-direct 之前，所以先算出走代理的条目再插入。
+    if cfg.dns.fake_ip and cfg.proxy.traffic_mode == "tun":
+        servers.extend(_fakeip_servers(cfg))
+        proxy_entries = list(cfg.routing.proxy_domains) + list(learned.get("proxy") or [])
+        fakeip_rule = _domain_match(proxy_entries)
+        if fakeip_rule:
+            rules.insert(0, {**fakeip_rule, "action": "route", "server": "dns-fakeip"})
 
     add(cfg.routing.proxy_domains, "dns-proxy")     # 白名单：恒用服务器侧解析
     add(cfg.routing.direct_domains, "dns-direct")   # 黑名单：国内 DNS
@@ -211,6 +229,12 @@ def build(cfg: ClientConfig, password: str, *, active: str | None = None, learne
 
     # ---- 路由：内部保留 → 白名单 → 黑名单 → 学到的名单 → 规则集 → 默认动作 ----
     route_rules.append({"ip_is_private": True, "action": "route", "outbound": "direct"})
+
+    # fake-ip 段的流量必须在「嗅探」之后按域名分流，不能被下面的 ip_cidr 规则当成普通 IP 匹配。
+    # 放在 ip_is_private 之后、名单规则之前：此时 sniff 已经拿到域名，按域名走默认动作即可。
+    if cfg.dns.fake_ip and tun:
+        fake_nets = [cfg.dns.fake_ip_range] + ([cfg.dns.fake_ip_range_v6] if cfg.dns.fake_ip_range_v6 else [])
+        route_rules.append({"ip_cidr": fake_nets, "action": "sniff"})
 
     def add(entries: list[str], outbound: str) -> None:
         m = split_entries(entries)

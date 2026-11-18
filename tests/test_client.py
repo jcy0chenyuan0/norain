@@ -158,6 +158,56 @@ def test_field_errors(client):
     assert "proxy.server" in errs(client)
 
 
+def test_fake_ip_enabled_for_tun(client):
+    """fake-ip：只给走代理的域名返回假 IP。
+
+    TUN 下客户端只嗅探不覆盖目标（sing-box 1.13 移除了 sniff_override_destination），
+    服务端只能收到 IP；fake-ip 让 sing-box 在出站前用域名替换假 IP，
+    等价于恢复旧机制。
+    """
+    client.write(protocol="hysteria2", proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\n'
+                       '[routing]\nproxy_domains = ["claude.ai", "google.com"]\n'
+                       'direct_domains = ["baidu.com"]')
+    doc = generate.build(load_config(client.config), PASSWORD)
+    fake = next(s for s in doc["dns"]["servers"] if s.get("type") == "fakeip")
+    assert fake["tag"] == "dns-fakeip" and fake["inet4_range"] == "198.18.0.0/15"
+    # 只对白名单域名启用
+    first = doc["dns"]["rules"][0]
+    assert first["server"] == "dns-fakeip"
+    assert set(first["domain_suffix"]) == {"claude.ai", "google.com"}
+    # 直连域名不能走 fake-ip
+    assert {"domain_suffix": ["baidu.com"], "action": "route", "server": "dns-direct"} in doc["dns"]["rules"]
+    # fake-ip 段的流量要单独嗅探后再按域名分流
+    assert {"ip_cidr": ["198.18.0.0/15"], "action": "sniff"} in doc["route"]["rules"]
+
+
+def test_fake_ip_off_by_default(client):
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[routing]\nproxy_domains = ["claude.ai"]')
+    doc = generate.build(load_config(client.config), PASSWORD)
+    assert all(s.get("type") != "fakeip" for s in doc["dns"]["servers"])
+    assert all("ip_cidr" not in r for r in doc["route"]["rules"])
+
+
+def test_fake_ip_ignored_outside_tun(client):
+    """mixed / system-proxy 本来就能带域名给服务端，不需要 fake-ip。"""
+    client.write(proxy_extra='traffic_mode = "mixed"', base=False,
+                 extra='[dns]\nfake_ip = true\n[routing]\nproxy_domains = ["claude.ai"]')
+    doc = generate.build(load_config(client.config), PASSWORD)
+    assert all(s.get("type") != "fakeip" for s in doc["dns"]["servers"])
+
+
+def test_fake_ip_v6_range(client):
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range_v6 = "fc00::/18"\n'
+                       '[routing]\nproxy_domains = ["claude.ai"]')
+    doc = generate.build(load_config(client.config), PASSWORD)
+    fake = next(s for s in doc["dns"]["servers"] if s.get("type") == "fakeip")
+    assert fake["inet6_range"] == "fc00::/18"
+    assert {"ip_cidr": ["198.18.0.0/15", "fc00::/18"], "action": "sniff"} in doc["route"]["rules"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="断言的是 POSIX 路径字符串，Windows 上 Path 会渲染成反斜杠")
 def test_paths_per_platform():
     win = Paths.from_env({"APPDATA": r"C:\Users\u\AppData\Roaming",

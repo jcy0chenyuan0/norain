@@ -145,6 +145,9 @@ class Dns(_Strict):
     public_doh: str = "https://1.1.1.1/dns-query"        # 分流判断用的 JSON 查询接口（经代理）
     strategy: Literal["prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only"] = "prefer_ipv4"
     cache_ttl_seconds: int = Field(300, ge=0)            # 学到的解析结果（hosts 覆盖）的保留时间
+    fake_ip: bool = False                                # 只对走代理的域名用 fake-ip（见 ADR 0006）
+    fake_ip_range: str = "198.18.0.0/15"                 # fake-ip v4 段（RFC 2544 保留段）
+    fake_ip_range_v6: str = ""                           # fake-ip v6 段，空表示不启用
 
 
 class Monitor(_Strict):
