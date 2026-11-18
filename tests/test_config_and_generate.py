@@ -140,6 +140,48 @@ def test_warp_address_is_validated(server):
     assert "routing.warp.address" in errs
 
 
+def test_warp_ip_cidr_lets_tun_traffic_hit_warp(server):
+    """TUN 下服务端只收到 IP：domain_suffix 匹配不到，必须靠 ip_cidr 命中 WARP。
+
+    sing-box 1.13+ 移除了 sniff_override_destination，客户端只嗅探不覆盖目标，
+    所以这条兜底是 TUN 场景下唯一能让服务端分流失效不至于全落直连的手段。
+    """
+    server.write_config(extra='[routing.warp]\naddress = "127.0.0.1:40000"\n'
+                              'domains = ["claude.ai"]\n'
+                              'ip_cidr = ["104.16.0.0/12", "172.64.0.0/13"]\n')
+    cfg = load_config(server.config, env={})
+    doc = generate.build(cfg, PASSWORD, server.state / "c.crt", server.state / "c.key")
+    assert doc["route"]["rules"] == [{
+        "domain_suffix": ["claude.ai"],
+        "ip_cidr": ["104.16.0.0/12", "172.64.0.0/13"],
+        "outbound": "warp",
+    }]
+
+
+def test_warp_ip_cidr_alone_is_enough(server):
+    """只配 ip_cidr 也要能工作：纯 IP 场景不需要域名规则。"""
+    server.write_config(extra='[routing.warp]\naddress = "127.0.0.1:40000"\n'
+                              'domains = []\nip_cidr = ["104.16.0.0/12"]\n')
+    cfg = load_config(server.config, env={})
+    doc = generate.build(cfg, PASSWORD, server.state / "c.crt", server.state / "c.key")
+    assert doc["route"]["rules"] == [{"ip_cidr": ["104.16.0.0/12"], "outbound": "warp"}]
+
+
+def test_warp_requires_domains_or_ip_cidr(server):
+    """两者都空时要报错，而不是静默生成一条匹配不到任何东西的规则。"""
+    server.write_config(extra='[routing.warp]\naddress = "127.0.0.1:40000"\n'
+                              'domains = []\nip_cidr = []\n')
+    errs = errors_of(server)
+    assert "routing.warp.domains" in errs
+
+
+def test_warp_ip_cidr_is_validated(server):
+    server.write_config(extra='[routing.warp]\naddress = "127.0.0.1:40000"\n'
+                              'domains = ["claude.ai"]\nip_cidr = ["not-a-cidr"]\n')
+    errs = errors_of(server)
+    assert "routing.warp.ip_cidr" in errs
+
+
 def test_single_protocol_and_fallback(server):
     server.write_config(extra="")
     text = server.config.read_text().replace(

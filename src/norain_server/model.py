@@ -93,12 +93,17 @@ WARP_DOMAINS = ["claude.ai", "claude.com", "anthropic.com", "anthropic.ai",
 
 
 class Warp(_Strict):
-    """把指定域名从本机 WARP（Cloudflare Zero Trust Client 的 socks5）出去。
+    """把指定域名或目标地址从本机 WARP（Cloudflare Zero Trust Client 的 socks5）出去。
 
     原来的服务端就是这么干的（claude/anthropic 走 WARP，其余直连）；不配就不产生路由规则。
+
+    ip_cidr 用于「服务端只拿到 IP」的场景：客户端 TUN 模式下，sing-box 1.13+ 移除了
+    sniff_override_destination，只有嗅探（route action sniff）而无覆盖，转发给服务端的
+    目标仍是 IP，domain_suffix 匹配不到。此时按目标 IP 段命中 WARP 才能保住分流。
     """
     address: str = "127.0.0.1:40000"
     domains: list[str] = Field(default_factory=lambda: list(WARP_DOMAINS))
+    ip_cidr: list[str] = Field(default_factory=list)   # 目标 IP 段（TUN 场景兜底）
 
 
 class Routing(_Strict):
@@ -231,8 +236,14 @@ def _cross_checks(cfg: ServerConfig) -> list[FieldError]:
         host, _, port = warp.address.rpartition(":")
         if not host or not port.isdigit() or not 0 < int(port) < 65536:
             errs.append(FieldError("routing.warp.address", "必须是 host:port 形式，例如 127.0.0.1:40000"))
-        if not warp.domains:
-            errs.append(FieldError("routing.warp.domains", "至少写一个要走 WARP 的域名"))
+        if not warp.domains and not warp.ip_cidr:
+            errs.append(FieldError("routing.warp.domains",
+                                   "domains 和 ip_cidr 至少要写一个（TUN 下只有 IP，需要 ip_cidr）"))
+        for e in warp.ip_cidr:
+            try:
+                ipaddress.ip_network(e.strip(), strict=False)
+            except ValueError:
+                errs.append(FieldError("routing.warp.ip_cidr", f"{e!r} 不是合法的 IP 段，例如 104.16.0.0/12"))
     return errs
 
 

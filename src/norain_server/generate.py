@@ -79,12 +79,20 @@ def build(cfg: ServerConfig, password: str, cert: Path, key: Path, *,
     outbounds: list[dict] = [{"type": "direct", "tag": "direct"}]
     route_rules: list[dict] = []
     warp = cfg.routing.warp
-    if warp is not None and warp.domains:
-        # 与原来的服务端一致：这些域名从本机 WARP 出去，其余直连
+    if warp is not None and (warp.domains or warp.ip_cidr):
+        # 与原来的服务端一致：这些域名/网段从本机 WARP 出去，其余直连。
+        # 域名规则先匹配（客户端走 mixed 入站时目标就是域名）；
+        # ip_cidr 是 TUN 场景的兜底——sing-box 1.13+ 去掉了 sniff_override_destination，
+        # 客户端只嗅探不覆盖，服务端收到的目标仍是 IP，只能按 IP 段命中。
         host, _, port = warp.address.rpartition(":")
         outbounds.insert(0, {"type": "socks", "tag": "warp", "server": host, "server_port": int(port)})
-        route_rules.append({"domain_suffix": [d.strip().lower() for d in warp.domains],
-                            "outbound": "warp"})
+        rule: dict = {}
+        if warp.domains:
+            rule["domain_suffix"] = [d.strip().lower() for d in warp.domains]
+        if warp.ip_cidr:
+            rule["ip_cidr"] = [c.strip() for c in warp.ip_cidr]
+        rule["outbound"] = "warp"
+        route_rules.append(rule)
     doc: dict = {
         "log": {"level": cfg.logging.level, "timestamp": True},
         "inbounds": inbounds,

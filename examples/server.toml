@@ -32,9 +32,15 @@ private_key = "/etc/norain-server/tls/privkey.pem"
 
 # 可选：本机 WARP 分流。配了以后这些域名从 Cloudflare Zero Trust Client 的 socks5 出去，
 # 其余仍然直连（原来的服务端就是这么把 claude/anthropic 送出去的）。
+#
+# ip_cidr 是 TUN 客户端的兜底：sing-box 1.13 移除了 sniff_override_destination，
+# TUN 模式下客户端只嗅探不覆盖目标，服务端收到的目标仍是 IP，只写 domains 会匹配不到，
+# 流量落到 final = direct。按目标 IP 段再写一条就能命中 WARP。
+# 注意 Cloudflare 网段很宽（104.16.0.0/12 涵盖大量站点），能写窄就不要写宽。
 # [routing.warp]
 # address = "127.0.0.1:40000"
 # domains = ["claude.ai", "claude.com", "anthropic.com", "anthropic.ai", "claudeusercontent.com", "cla.st"]
+# ip_cidr = ["104.16.0.0/12", "172.64.0.0/13"]
 
 [service]
 check_interval_seconds = 30   # 健康检查间隔
