@@ -186,13 +186,15 @@ def _dns(cfg: ClientConfig, learned: dict, geosite_tags: list[str], strategy: st
 
 
 def build(cfg: ClientConfig, password: str, *, active: str | None = None, learned: dict | None = None,
-          rules: dict[str, Path] | None = None, strategy: str | None = None) -> dict:
+          rules: dict[str, Path] | None = None, strategy: str | None = None,
+          cache_path: str | None = None) -> dict:
     """生成 sing-box 配置。
 
-    active    当前协议（auto 时由内控制模块决定）
-    learned   分流模块学到的名单：{"proxy": [...], "direct": [...], "hosts": {域名: [IP]}}
-    rules     可用的规则集文件：{标签: 路径}
-    strategy  DNS 的 IPv4/IPv6 策略覆盖（自维持模块处理 604/606 时使用）
+    active     当前协议（auto 时由内控制模块决定）
+    learned    分流模块学到的名单：{"proxy": [...], "direct": [...], "hosts": {域名: [IP]}}
+    rules      可用的规则集文件：{标签: 路径}
+    strategy   DNS 的 IPv4/IPv6 策略覆盖（自维持模块处理 604/606 时使用）
+    cache_path fake-ip 映射的缓存文件路径（只在启用 fake-ip 时需要）
     """
     learned = learned or {}
     rules = rules or {}
@@ -259,13 +261,20 @@ def build(cfg: ClientConfig, password: str, *, active: str | None = None, learne
     if tun:
         route["auto_detect_interface"] = True  # 出站绑定物理网卡，避免被自己的 TUN 接管形成环路
 
-    return {
+    doc: dict = {
         "log": {"level": cfg.logging.level, "timestamp": True},
         "dns": dns,
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": route,
     }
+    # fake-ip 的「假 IP -> 域名」映射靠 cache_file 持久化；不开的话反查会失败，
+    # 日志报 `missing fakeip record`，应用拿到假 IP 后直接连不上。
+    if cfg.dns.fake_ip and tun:
+        doc["experimental"] = {
+            "cache_file": {"enabled": True, "path": cache_path or "norain-cache.db"},
+        }
+    return doc
 
 
 def context(cfg: ClientConfig, paths: Paths | None) -> dict:
@@ -279,7 +288,10 @@ def context(cfg: ClientConfig, paths: Paths | None) -> dict:
 
 
 def render(cfg: ClientConfig, secret: Secret, paths: Paths | None = None) -> bytes:
-    return dumps(build(cfg, secret.value, **context(cfg, paths)))
+    ctx = context(cfg, paths)
+    if paths is not None and cfg.dns.fake_ip and cfg.proxy.traffic_mode == "tun":
+        ctx["cache_path"] = str(paths.state / "singbox-cache.db")
+    return dumps(build(cfg, secret.value, **ctx))
 
 
 def apply(cfg: ClientConfig, secret: Secret, paths: Paths, binary: Path):

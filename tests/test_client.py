@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -190,12 +191,47 @@ def test_fake_ip_off_by_default(client):
     assert all("ip_cidr" not in r for r in doc["route"]["rules"])
 
 
+def test_fake_ip_requires_cache_file(monkeypatch):
+    """fake-ip 的「假 IP → 域名」映射靠 experimental.cache_file 持久化。
+
+    不开的话 sing-box 日志会报 `missing fakeip record`，应用拿到假 IP 后直接连不上 ——
+    比不开 fake-ip 还糟。这条测试锁住「启用 fake-ip 必须同时启用 cache_file」。
+    """
+    monkeypatch.setenv("NORAIN_TEST_PW", "pw1234567890")
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        p = d / "cfg.toml"
+        p.write_text(
+            'schema = 1\n[proxy]\nserver = "47.89.152.13"\ntraffic_mode = "tun"\n'
+            'credential_ref = "env:NORAIN_TEST_PW"\n'
+            '[proxy.tls]\nserver_name = "www.bing.com"\ninsecure = true\n'
+            '[dns]\nfake_ip = true\n[routing]\nproxy_domains = ["claude.ai"]\n',
+            encoding="utf-8")
+        cfg = load_config(p)
+        paths = Paths(home=d, config=p, state=d / "state", log_dir=d / "log",
+                      log_dir_from_env=False, singbox=None, platform="nt")
+        doc = json.loads(generate.render(cfg, generate.resolve_secret(cfg), paths))
+        cache = doc["experimental"]["cache_file"]
+        assert cache["enabled"] is True
+        # 必须落在状态目录里，否则重启后映射丢失
+        assert Path(cache["path"]) == paths.state / "singbox-cache.db"
+
+
+def test_no_cache_file_without_fake_ip(client):
+    """默认不生成 experimental，保持配置最小。"""
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[routing]\nproxy_domains = ["claude.ai"]')
+    doc = generate.build(load_config(client.config), PASSWORD)
+    assert "experimental" not in doc
+
+
 def test_fake_ip_ignored_outside_tun(client):
     """mixed / system-proxy 本来就能带域名给服务端，不需要 fake-ip。"""
     client.write(proxy_extra='traffic_mode = "mixed"', base=False,
                  extra='[dns]\nfake_ip = true\n[routing]\nproxy_domains = ["claude.ai"]')
     doc = generate.build(load_config(client.config), PASSWORD)
     assert all(s.get("type") != "fakeip" for s in doc["dns"]["servers"])
+    assert "experimental" not in doc
 
 
 def test_fake_ip_v6_range(client):
