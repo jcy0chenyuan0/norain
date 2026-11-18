@@ -268,8 +268,10 @@ def build(cfg: ClientConfig, password: str, *, active: str | None = None, learne
         "outbounds": outbounds,
         "route": route,
     }
-    # fake-ip 的「假 IP -> 域名」映射靠 cache_file 持久化；不开的话反查会失败，
-    # 日志报 `missing fakeip record`，应用拿到假 IP 后直接连不上。
+    # cache_file 让 fake-ip 的「假 IP -> 域名」映射跨进程重启保持稳定。
+    # 实测（sing-box 1.14.4）：不启用它，同一个进程内以及重启后重新解析都能正常工作；
+    # 但重启后若应用直接连接旧假 IP（不先解析），没有持久化映射时反查会失败，日志报
+    # `missing fakeip record`。开着能避免这种「钉死旧 IP 就断」的情况，代价是一个小文件。
     if cfg.dns.fake_ip and tun:
         doc["experimental"] = {
             "cache_file": {"enabled": True, "path": cache_path or "norain-cache.db"},

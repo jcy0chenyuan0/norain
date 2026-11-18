@@ -1,4 +1,4 @@
-"""客户端（阶段 2）测试。生命周期部分使用模拟 sing-box。"""
+﻿"""客户端（阶段 2）测试。生命周期部分使用模拟 sing-box。"""
 
 import json
 import os
@@ -256,6 +256,7 @@ def test_paths_per_platform():
     assert str(Paths.from_env({"HOME": "/h", "NORAIN_CONFIG": "/x/c.toml"}, platform="posix").config) == "/x/c.toml"
 
 
+@pytest.mark.slow
 def test_lifecycle_chain(client):
     r = client.cli("config", "validate", "--json")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -283,6 +284,7 @@ def test_lifecycle_chain(client):
         socket.create_connection(("127.0.0.1", client.port), timeout=1)
 
 
+@pytest.mark.slow
 def test_stop_via_stop_file_only(client):
     """Windows 上不能靠信号干净停止；这里验证只写停止请求文件也能停下来。"""
     assert client.cli("start").returncode == 0
@@ -296,6 +298,7 @@ def test_stop_via_stop_file_only(client):
     assert not psutil.pid_exists(st["process"]["pid"])
 
 
+@pytest.mark.slow
 def test_port_conflict_and_restart_limit(client):
     with socket.socket() as s:
         s.bind(("127.0.0.1", client.port))
@@ -311,6 +314,7 @@ def test_port_conflict_and_restart_limit(client):
     assert client.status()["restarts"] == 1
 
 
+@pytest.mark.slow
 def test_restart_with_bad_config_keeps_running(client):
     assert client.cli("start").returncode == 0
     pid = client.status()["process"]["pid"]

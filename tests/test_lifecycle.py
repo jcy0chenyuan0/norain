@@ -7,6 +7,7 @@ import subprocess
 import time
 
 import psutil
+import pytest
 
 from norain_server.service import SystemdBackend, UNIT
 
@@ -23,6 +24,7 @@ def wait_for(fn, timeout=15):
     raise AssertionError("超时")
 
 
+@pytest.mark.slow
 def test_validate_start_status_stop_chain(server):
     r = server.cli("config", "validate", "--json")
     assert r.returncode == 0, r.stderr
@@ -58,6 +60,7 @@ def test_validate_start_status_stop_chain(server):
     assert server.cli("_desired-state-is", "running").returncode == 1
 
 
+@pytest.mark.slow
 def test_crashed_singbox_is_restarted_then_stays_up(server):
     # 第一次启动崩溃，守护自动重启后就绪，start 最终成功
     assert server.cli("start", env={"FAKE_SB_CRASH_ONCE": str(server.tmp / "crashed")}).returncode == 0
@@ -66,6 +69,7 @@ def test_crashed_singbox_is_restarted_then_stays_up(server):
     assert st["last_error"]["business_code"] == 140  # 保留最近错误
 
 
+@pytest.mark.slow
 def test_restart_limit_stops_restarting(server):
     server.write_config(limit=2)
     r = server.cli("start", env={"FAKE_SB_CRASH": "1"})
@@ -77,6 +81,7 @@ def test_restart_limit_stops_restarting(server):
     assert '"daemon.restart_limit"' in log
 
 
+@pytest.mark.slow
 def test_health_check_detects_missing_listener_and_fatal(server):
     server.write_config(limit=0)
     r = server.cli("start", "--json", env={"FAKE_SB_NO_LISTEN": "1"})
@@ -89,6 +94,7 @@ def test_health_check_detects_missing_listener_and_fatal(server):
     wait_for(lambda: "日志出现 fatal" in (server.logs / "norain-server.log").read_text(encoding="utf-8", errors="replace"))
 
 
+@pytest.mark.slow
 def test_start_refuses_bad_config_and_port_in_use(server):
     server.write_config(tls_mode="manual")
     r = server.cli("start", "--json")
@@ -108,6 +114,7 @@ def test_start_refuses_bad_config_and_port_in_use(server):
     assert r.returncode == 5 and json.loads(r.stdout)["business_code"] == 150
 
 
+@pytest.mark.slow
 def test_restart_keeps_old_process_when_new_config_invalid(server):
     assert server.cli("start").returncode == 0
     pid = server.status()["process"]["pid"]

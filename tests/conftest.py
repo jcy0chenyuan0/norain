@@ -107,8 +107,16 @@ def pytest_configure(config):
     _PROGRESS["enabled"] = os.environ.get("NORAIN_TEST_PROGRESS", "") not in ("", "0")
 
 
+def pytest_addoption(parser):
+    parser.addoption("--full", action="store_true", default=False,
+                     help="跑全量测试，包括要等真实崩溃/重启周期的 slow 用例")
+
+
 def pytest_collection_modifyitems(session, config, items):
     _PROGRESS["total"] = len(items)
+    if config.getoption("--full"):
+        # --full：把 pyproject 里默认的 "-m 'not slow'" 去掉
+        config.option.markexpr = ""
 
 
 def pytest_runtest_logreport(report):

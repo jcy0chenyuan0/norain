@@ -46,3 +46,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
+markers = [
+    "slow: 端到端生命周期测试，要等真实的崩溃/重启/健康检查周期（全量档才跑）",
+]
+
+# 默认只跑必要测试：改一个配置或一行逻辑时，几十秒内就能得到反馈。
+# 跑全量用 `pytest --full`（见 tests/conftest.py 里的 addopts 处理），
+# 或显式 `pytest -m ""`。
+addopts = "-m 'not slow'"
