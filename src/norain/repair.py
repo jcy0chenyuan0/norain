@@ -188,7 +188,7 @@ def repair_full(paths: Paths, log: Logger | None = None) -> Report:
     from .model import load_config
     rep = Report("full")
     try:
-        if block.release(paths, log=log)["was_active"]:
+        if block.release(paths, log=log, force=True)["was_active"]:   # 用户明确要求完全修复
             rep.actions.append("已解除阻断，恢复防火墙")
     except NorainError as e:
         rep.problems.append(f"{e.message}（{e.hint}）")

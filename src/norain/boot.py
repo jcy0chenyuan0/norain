@@ -136,7 +136,7 @@ def pre_start(paths: Paths, log: Logger | None = None) -> dict:
     """测试检测模式的第一步：处于阻断模式时自动恢复为非阻断模式。"""
     if not block.is_active(paths) and not (paths.block_state.exists()):
         return {"was_blocked": False}
-    res = block.release(paths, log=log)
+    res = block.release(paths, log=log, force=True)   # 用户明确要求启动：解除阻断
     if log:
         log.info("boot.block_released", was_active=res["was_active"])
     return {"was_blocked": res["was_active"]}

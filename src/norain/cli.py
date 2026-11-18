@@ -404,7 +404,8 @@ def cmd_status(args, paths: Paths) -> int:
         print("配置无效，运行 norain config validate 查看详情")
     if st["block"]["active"]:
         print(f"阻断模式：已启用（错误码 {st['block']['code']}，{st['block']['engaged_at']}）。"
-              "解除：norain block off")
+              + ("正在修复中，只放行代理服务器。" if st["block"].get("repairing") else "")
+              + f"解除：{st['block']['restore_command']}")
     if st.get("monitor"):
         print(f"链路检测：错误码 {st['monitor']['code']}（{st['monitor']['meaning']}）")
     else:
@@ -526,7 +527,7 @@ def cmd_block(args, paths: Paths) -> int:
         _out(args, st, text)
         return EXIT_OK
     if args.action == "off":
-        res = block.release(paths, log=_logger(paths, "block"))
+        res = block.release(paths, log=_logger(paths, "block"), force=bool(getattr(args, "force", False)))
         _out(args, res, ("已解除阻断，防火墙恢复正常放行。" if res["was_active"] else "当前不在阻断模式。")
              + "\n注意：这不代表代理已修复，此时代理不一定在运行；流量会直连。启动代理：norain start")
         return EXIT_OK
@@ -703,6 +704,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     bk = add(sub, "block", cmd_block, "阻断模式：status / off（手动解除）/ on（手动进入）")
     bk.add_argument("action", choices=["status", "off", "on"])
+    # 修复还没成功时（repairing），off 需要显式确认：放开后流量会直连
+    bk.add_argument("--force", action="store_true", help="代理仍未修复时也强行解除（流量会直连）")
 
     on = add(sub, "once", cmd_once, "一次性执行某个模块的某个功能")
     on.add_argument("what", choices=["monitor", "select", "route", "rules-update", "rules-rollback", "scan"],

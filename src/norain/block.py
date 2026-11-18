@@ -31,7 +31,7 @@ from norain_core.errors import EXIT_EXTERNAL, NorainError
 from norain_core.log import Logger
 from norain_core.state import read_json, write_json
 
-from .model import ClientConfig, split_entries
+from .model import ClientConfig, load_config, split_entries
 from .monitor import GUESS, MEANING
 from .paths import Paths
 
@@ -88,6 +88,25 @@ def allowed(cfg: ClientConfig) -> tuple[list, list, dict]:
         host = urlsplit(url).hostname
         if host:
             add_host(host)
+    v4 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
+    v6 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 6))
+    return v4, v6, notes
+
+
+def proxy_only(cfg: ClientConfig) -> tuple[list, list, dict]:
+    """修复窗口的临时放行范围：只有固定回环和代理服务器（及其端口可达的地址）。
+
+    修复必须真的能连上代理服务器才算验证通过，所以还要放行代理服务器。不能再放国内 DNS、
+    蓝名单和监控探测目标：这些地址会被 monitor.verify 误判成「已恢复」，从而过早解除阻断。
+    """
+    nets: list = [ipaddress.ip_network(n) for n in _BASE4 + _BASE6]
+    notes: dict = {"resolved": {}, "unresolved": []}
+    ips = _resolve(cfg.proxy.server)
+    if ips:
+        notes["resolved"][cfg.proxy.server] = ips
+        nets.extend(ipaddress.ip_network(ip) for ip in ips)
+    else:
+        notes["unresolved"].append(cfg.proxy.server)
     v4 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
     v6 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 6))
     return v4, v6, notes
@@ -214,18 +233,21 @@ def status(paths: Paths) -> dict:
     st = state(paths) or {}
     return {"active": bool(st.get("active")), "engaged_at": st.get("engaged_at"), "code": st.get("code"),
             "reason": st.get("reason"), "guesses": st.get("guesses", []), "backend": st.get("backend"),
+            "repairing": bool(st.get("repairing")),
             "allowed": st.get("allowed", []), "unresolved": st.get("unresolved", []),
-            "restore_command": "norain block off",
+            "restore_command": "norain block off" + (" --force" if st.get("repairing") else ""),
             "manual_restore": MANUAL_RESTORE["nt" if osutil.IS_WINDOWS else "posix"]}
 
 
-def message(code: int, reason: str) -> str:
+def message(code: int, reason: str, *, repairing: bool = False) -> str:
     guesses = GUESS.get(code, ["代理进程无法启动或反复崩溃", "配置或程序文件损坏"])
     return ("代理无法正常工作，为防止真实 IP 暴露，已切断除蓝名单以外的网络连接。\n\n"
             f"错误码：{code}（{MEANING.get(code, '代理无法维持')}）\n"
             + (f"依据：{reason}\n" if reason else "")
             + "可能原因：\n" + "".join(f"  · {g}\n" for g in guesses)
-            + "\n恢复网络：在管理员终端运行  norain block off\n"
+            + ("\n正在自动修复：目前只放行代理服务器，修好后会自动恢复全部网络。\n" if repairing else "")
+            + "\n恢复网络：在管理员终端运行  norain block off"
+            + ("  --force（代理还没修好，放开后流量会直连）" if repairing else "") + "\n"
               "重新启动代理：norain start（启动时会自动解除阻断）\n"
               "注意：解除阻断不代表代理已修复，解除后流量会直连。")
 
@@ -233,15 +255,19 @@ def message(code: int, reason: str) -> str:
 # ---- 进入与解除 ----------------------------------------------------------------
 
 def engage(cfg: ClientConfig, paths: Paths, *, code: int, reason: str, log: Logger | None = None,
-           notify: bool = True) -> dict:
-    """进入阻断模式。失败时回滚并抛出错误（调用方要知道阻断没有生效）。"""
+           notify: bool = True, repairing: bool = False) -> dict:
+    """进入阻断模式。失败时回滚并抛出错误（调用方要知道阻断没有生效）。
+
+    repairing=True 表示随后就要修复：此时只放行代理服务器（见 proxy_only），修好后再用
+    tighten() 换成完整放行范围；否则直接用完整范围。
+    """
     osutil.require_admin("进入阻断模式", module="block")
     be = backend()
-    v4, v6, notes = allowed(cfg)
+    v4, v6, notes = proxy_only(cfg) if repairing else allowed(cfg)
     st = {
         "active": True, "engaged_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "code": code, "reason": reason,
         "guesses": GUESS.get(code, []), "backend": be.name, "rules": [],
-        "firewall_profiles": be.snapshot(),
+        "firewall_profiles": be.snapshot(), "repairing": bool(repairing),
         "allowed": [str(n) for n in v4 + v6], "resolved": notes["resolved"], "unresolved": notes["unresolved"],
         "restore_command": "norain block off",
         "manual_restore": MANUAL_RESTORE["nt" if osutil.IS_WINDOWS else "posix"],
@@ -256,20 +282,106 @@ def engage(cfg: ClientConfig, paths: Paths, *, code: int, reason: str, log: Logg
     write_json(paths.block_state, st)
     if log:
         log.error("block.engaged", code=code, reason=reason, backend=be.name, rules=len(st["rules"]),
-                  unresolved=notes["unresolved"])
+                  repairing=repairing, unresolved=notes["unresolved"])
     if notify:
-        text = message(code, reason)
+        text = message(code, reason, repairing=repairing)
         if not osutil.popup("Norain 已进入阻断模式", text) and log:
             log.error("block.popup_unavailable", text=text)
     return st
 
 
-def release(paths: Paths, *, log: Logger | None = None) -> dict:
-    """解除阻断，恢复正常的防火墙放行。幂等：没有状态文件时也会清理残留规则。"""
+def tighten(paths: Paths, *, log: Logger | None = None) -> dict:
+    """把修复窗口的临时放行范围收回到完整放行范围。重复调用是幂等的。
+
+    失败语义很重要：remove 之后、apply 成功之前，系统里可能一条阻断规则都没有。
+    所以这里一旦中途失败，必须把修复窗口的窄范围重新装回去，然后把错误抛给调用方。
+    调用方据此决定不要解除阻断（见 maintain._unblock_after_repair）。
+    """
+    st = state(paths)
+    if not st or not st.get("repairing") or not st.get("active"):
+        return st or {}
+    be = backend()
+    try:
+        cfg = _reload_cfg(paths)
+        v4, v6, notes = allowed(cfg)
+    except NorainError as e:  # 重新生成放行范围失败：保留修复窗口的窄范围，不放宽
+        if log:
+            log.warn("block.tighten_skipped", error=e.message, note="保留修复窗口的放行范围")
+        return st
+    if cfg.proxy.server in notes["unresolved"]:
+        # 代理域名解析不出来时，新范围里会丢掉代理服务器 —— 收紧后就再也连不上代理了
+        if log:
+            log.warn("block.tighten_skipped", unresolved=cfg.proxy.server,
+                     note="代理服务器解析失败，保留修复窗口的放行范围")
+        return st
+    fresh = dict(st, repairing=False, allowed=[str(n) for n in v4 + v6],
+                 resolved=notes["resolved"], unresolved=notes["unresolved"])
+    try:
+        be.remove(st)
+        fresh["rules"] = be.apply(v4, v6)
+    except NorainError as e:
+        if log:
+            log.error("block.tighten_failed", error=e.message, restoring=st.get("allowed"))
+        restored = _restore_narrow(be, st, log=log)
+        if not restored:
+            # 窄范围也装不回去：系统里可能没有阻断规则了。把状态标成未生效，
+            # 让调用方别再以为「阻断还活着」，也让人工恢复命令能显示出来。
+            broken = dict(st, active=False, repairing=False, broken=True)
+            try:
+                write_json(paths.block_state, broken)
+            except OSError:
+                pass
+            raise NorainError(
+                f"收紧放行范围失败，且没能恢复修复期间的放行范围：{e.message}",
+                exit_code=EXIT_EXTERNAL, module="block",
+                hint="当前可能没有阻断规则，流量会直连。请检查防火墙，"
+                     "手工恢复命令：" + MANUAL_RESTORE["nt" if osutil.IS_WINDOWS else "posix"]) from None
+        raise
+    write_json(paths.block_state, fresh)
+    if log:
+        log.info("block.tightened", allowed=fresh["allowed"], unresolved=notes["unresolved"])
+    return fresh
+
+
+def _restore_narrow(be, st: dict, *, log: Logger | None) -> bool:
+    """把修复窗口的窄范围重新装回去。用状态文件里记录的 allowed（就是当时生效的那份）。"""
+    try:
+        v4, v6 = _nets_from(st.get("allowed", []))
+        if not v4 and not v6:
+            return False
+        be.remove({"rules": st.get("rules", [])})
+        be.apply(v4, v6)
+        return True
+    except NorainError as e:
+        if log:
+            log.error("block.tighten_restore_failed", error=e.message)
+        return False
+
+
+def _reload_cfg(paths: Paths) -> ClientConfig:
+    return load_config(paths.config)
+
+
+def _nets_from(allowed_strs: list[str]) -> tuple[list, list]:
+    """把状态文件里的放行网段字符串还原成 (v4, v6)。"""
+    nets = [ipaddress.ip_network(s) for s in allowed_strs]
+    return [n for n in nets if n.version == 4], [n for n in nets if n.version == 6]
+
+
+def release(paths: Paths, *, log: Logger | None = None, force: bool = False) -> dict:
+    """解除阻断，恢复正常的防火墙放行。幂等：没有状态文件时也会清理残留规则。
+
+    只有一种情况拒绝解除：状态被标记为 broken（收紧放行范围失败，系统里可能已经没有
+    阻断规则了）。这时必须先人工确认，否则「解除成功」是一种误导。
+    """
     st = state(paths) or {}
     be = backend()
     if not st and not be.present():
         return {"was_active": False, "errors": []}
+    if st.get("broken") and not force:
+        raise NorainError("阻断状态已损坏，拒绝自动解除", exit_code=EXIT_EXTERNAL, module="block",
+                          hint="先检查防火墙是否还有 Norain-Block 规则；确认后加 --force 解除。"
+                               "手工恢复命令：" + MANUAL_RESTORE["nt" if osutil.IS_WINDOWS else "posix"])
     osutil.require_admin("解除阻断", module="block")
     errors = be.remove(st)
     if errors:

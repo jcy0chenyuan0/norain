@@ -134,7 +134,12 @@ class Maintainer:
         return done
 
     def escalate(self, code: int, reason: str) -> str:
-        """处理一个故障：修复 → 验证 → 修不好就阻断。返回 recovered / aborted / blocked / failed。"""
+        """处理一个故障：先阻断 → 修复 → 验证 → 修好就解除，修不好就保持阻断。
+
+        返回 recovered / aborted / blocked / failed。
+        阻断先行的原因：修复要花几秒到几十秒，这段时间流量会回落直连、暴露真实 IP。
+        只放行代理服务器的修复窗口见 block.engage(repairing=True)。
+        """
         ctl, cfg = self.ctl, self.ctl.cfg
         result = {"code": code, "reason": reason, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                   "attempts": [], "outcome": ""}
@@ -142,45 +147,18 @@ class Maintainer:
         ctl.enter_repair(code)
         outcome = "failed"
         try:
-            attempts = 0 if code == 301 else cfg.maintain.repair_attempts  # 301 直接阻断
-            for n in range(1, attempts + 1):
-                if self._stop.is_set() or get_desired(ctl.paths.desired) != RUNNING:
-                    outcome = "aborted"
-                    break
-                actions: list[str] = []
-                if n == 1 and code != PROXY_DOWN:
-                    actions += self._light_fix(code)
-                else:  # 自维持模块只用文件修复和内置配置修复
-                    ctl.stop_module("proxy", "maintain")
-                    for rep in (repair.repair_files(ctl.paths, self.log),
-                                repair.repair_builtin(ctl.paths, self.log)):
-                        actions += rep.actions + [f"未修好：{p}" for p in rep.problems]
-                    ctl.clear_learned()   # 内置配置修复清掉了磁盘上的名单，内存里的也要一起清
-                    ctl.set_override(dns_strategy=None)
-                ok, why = ctl.restart_proxy("maintain", f"修复错误码 {code}（第 {n} 轮）")
-                actions.append("重启代理" + ("" if ok else f"失败：{why}"))
-                ready = ok and ctl.proxy.wait_ready(30)
-                seen = ctl.verify(cfg.monitor.recovery_threshold) if ready else PROXY_DOWN
-                result["attempts"].append({"round": n, "actions": actions, "code_after": seen})
-                self.log.warn("maintain.repair_round", round=n, actions=actions, code_after=seen)
-                if seen == OK:
-                    outcome = "recovered"
-                    break
-                if seen == 100:  # 修复途中本地断网：不是代理的问题，不能据此阻断
-                    outcome = "aborted"
-                    break
-                code = seen if seen in MEANING or seen == PROXY_DOWN else code
-            if outcome == "failed":
-                if cfg.maintain.block_on_failure:
-                    try:
-                        block.engage(cfg, ctl.paths, code=code, reason=reason, log=self.log)
-                        outcome = "blocked"
-                    except NorainError as e:
-                        # 阻断没有生效必须明确告诉用户：此时流量可能直连
-                        self.log.error("maintain.block_failed", error=e.message, hint=e.hint)
-                        osutil.popup("Norain：代理失效且阻断没有生效",
-                                     f"代理无法恢复（错误码 {code}），并且无法进入阻断模式：{e.message}\n"
-                                     "当前流量可能直连，请立即检查。")
+            blocked = self._block_first(code, reason)
+            if blocked and ctl.stop_requested:
+                outcome = "aborted"   # 阻断期间用户要求停止：保持阻断退出，不继续修
+            else:
+                outcome, code = self._repair_rounds(code, reason, result)
+                if outcome == "recovered":
+                    if blocked:
+                        self._unblock_after_repair(ctl.paths)
+                    else:
+                        self.log.warn("maintain.recovered_without_block", note="阻断没有生效，修复成功")
+                elif blocked:
+                    outcome = "blocked"
                 ctl.request_shutdown(blocked=outcome == "blocked", code=code)
         finally:
             result["outcome"] = outcome
@@ -189,6 +167,81 @@ class Maintainer:
             self._pending = None
             self.log.warn("maintain.fault_handled", code=code, outcome=outcome)
         return outcome
+
+    def _block_first(self, code: int, reason: str) -> bool:
+        """立刻进入阻断。返回是否已阻断；失败时明确告知用户流量可能直连，但修复仍然要做。"""
+        ctl, cfg = self.ctl, self.ctl.cfg
+        if not cfg.maintain.block_on_failure:
+            return False
+        try:
+            block.engage(cfg, ctl.paths, code=code, reason=reason, log=self.log, repairing=True)
+            return True
+        except NorainError as e:
+            # 阻断没有生效必须明确告诉用户：此时流量可能直连，但修复仍然要做
+            self.log.error("maintain.block_failed", error=e.message, hint=e.hint)
+            osutil.popup("Norain：代理失效且阻断没有生效",
+                         f"代理无法恢复（错误码 {code}），并且无法进入阻断模式：{e.message}\n"
+                         "当前流量可能直连，请立即检查。")
+            return False
+
+    def _repair_rounds(self, code: int, reason: str, result: dict) -> tuple[str, int]:
+        """在阻断状态下修复。返回 (outcome, 最终错误码)。
+
+        最终错误码要回传给调用方：修复过程中可能看到新的错误码，弹窗和 last_error
+        应该报最后那个，而不是最初触发的那一个。
+        """
+        ctl, cfg = self.ctl, self.ctl.cfg
+        outcome = "failed"
+        attempts = 0 if code == 301 else cfg.maintain.repair_attempts  # 301 直接阻断，不修
+        for n in range(1, attempts + 1):
+            if ctl.stop_requested:
+                outcome = "aborted"
+                break
+            actions: list[str] = []
+            if n == 1 and code != PROXY_DOWN:
+                actions += self._light_fix(code)
+            else:  # 自维持模块只用文件修复和内置配置修复
+                ctl.stop_module("proxy", "maintain")
+                for rep in (repair.repair_files(ctl.paths, self.log),
+                            repair.repair_builtin(ctl.paths, self.log)):
+                    actions += rep.actions + [f"未修好：{p}" for p in rep.problems]
+                ctl.clear_learned()   # 内置配置修复清掉了磁盘上的名单，内存里的也要一起清
+                ctl.set_override(dns_strategy=None)
+            ok, why = ctl.restart_proxy("maintain", f"修复错误码 {code}（第 {n} 轮）")
+            actions.append("重启代理" + ("" if ok else f"失败：{why}"))
+            ready = ok and ctl.proxy.wait_ready(30)
+            seen = ctl.verify(cfg.monitor.recovery_threshold) if ready else PROXY_DOWN
+            result["attempts"].append({"round": n, "actions": actions, "code_after": seen})
+            self.log.warn("maintain.repair_round", round=n, actions=actions, code_after=seen)
+            if seen == OK:
+                outcome = "recovered"
+                break
+            if seen == 100:  # 修复途中本地断网：不是代理的问题，不能据此继续修
+                outcome = "aborted"
+                break
+            code = seen if seen in MEANING or seen == PROXY_DOWN else code
+        return outcome, code
+
+    def _unblock_after_repair(self, paths) -> None:
+        """修好了：把临时放行范围收回，然后解除阻断。
+
+        tighten 失败时必须中止：此时系统里可能一条阻断规则都不剩，再去 release 会把
+        残缺状态当成功清掉。宁可把错误暴露给用户，也不假装恢复完成。
+        """
+        try:
+            block.tighten(paths, log=self.log)
+        except NorainError as e:
+            self.log.error("maintain.tighten_failed", error=e.message, hint=e.hint,
+                           note="中止解除阻断，保持当前阻断状态")
+            osutil.popup("Norain：代理已修复，但恢复网络失败",
+                         f"代理已经恢复，但收紧放行范围时出错：{e.message}\n"
+                         + (e.hint or "") + "\n网络可能仍处于限制状态，请检查。")
+            return
+        try:
+            block.release(paths, log=self.log)
+            self.log.info("maintain.unblocked", note="修复成功，已恢复正常网络")
+        except NorainError as e:
+            self.log.error("maintain.unblock_failed", error=e.message, hint=e.hint)
 
     # ---- 模块生命周期 ----
 

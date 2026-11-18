@@ -329,6 +329,15 @@ class Controller:
         self.monitor.pause()
         self.log.warn("control.phase", phase=REPAIRING, code=code)
 
+    @property
+    def stop_requested(self) -> bool:
+        """本轮是否已被要求停止（_stop），或用户把期望状态改成了 stopped。
+
+        循环里用它代替直接看期望状态：阻断先行之后，进入阻断那一刻期望状态还是 running，
+        不能因为「已经不是 running」就说用户要停。
+        """
+        return self._stop.is_set() or get_desired(self.paths.desired) != RUNNING
+
     def leave_repair(self, outcome: str) -> None:
         if self.phase == REPAIRING:
             self.phase = RUNNING_PHASE
