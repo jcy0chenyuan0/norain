@@ -94,22 +94,79 @@ def allowed(cfg: ClientConfig) -> tuple[list, list, dict]:
 
 
 def proxy_only(cfg: ClientConfig) -> tuple[list, list, dict]:
-    """修复窗口的临时放行范围：只有固定回环和代理服务器（及其端口可达的地址）。
+    """修复窗口的临时放行范围：固定回环 + 代理服务器 + 蓝名单。
 
-    修复必须真的能连上代理服务器才算验证通过，所以还要放行代理服务器。不能再放国内 DNS、
-    蓝名单和监控探测目标：这些地址会被 monitor.verify 误判成「已恢复」，从而过早解除阻断。
+    修复必须真的能连上代理服务器才算验证通过，所以放行代理服务器。
+
+    蓝名单也放行：它的本意就是「别处都断了这些也要能用」，而修复可能持续几十秒甚至
+    到人工介入为止，这时候连蓝名单一起断掉是违背它存在意义的。代价是这些地址在修复
+    期间可达，可能让 monitor.verify 误判成「已恢复」—— 由 verify 自己跳过这些探测项
+    （见 monitor.Monitor.verify），而不是靠这里断开。
+
+    不放国内 DNS 和监控探测目标：它们的可达性没有用户体验上的必要性，只会干扰判定。
     """
     nets: list = [ipaddress.ip_network(n) for n in _BASE4 + _BASE6]
     notes: dict = {"resolved": {}, "unresolved": []}
-    ips = _resolve(cfg.proxy.server)
-    if ips:
-        notes["resolved"][cfg.proxy.server] = ips
-        nets.extend(ipaddress.ip_network(ip) for ip in ips)
-    else:
-        notes["unresolved"].append(cfg.proxy.server)
+
+    def add_host(host: str) -> None:
+        try:
+            nets.append(ipaddress.ip_network(host, strict=False))
+            return
+        except ValueError:
+            pass
+        ips = _resolve(host)
+        if ips:
+            notes["resolved"][host] = ips
+            nets.extend(ipaddress.ip_network(ip) for ip in ips)
+        else:
+            notes["unresolved"].append(host)
+
+    add_host(cfg.proxy.server)
+    m = split_entries(cfg.routing.isolation_allowlist)
+    for e in m.get("ip_cidr", []) + m.get("domain", []) + m.get("domain_suffix", []):
+        add_host(e)
     v4 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
     v6 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 6))
     return v4, v6, notes
+
+
+def exempt_hosts(cfg: ClientConfig) -> tuple[set[str], set[str], list]:
+    """修复窗口里被额外放行的域名和网段（蓝名单 + 代理服务器）。
+
+    返回 (精确域名, 后缀域名, 网段)。monitor.verify 用它们判断哪些探测目标在修复期间
+    「可达但不代表代理已修好」，从而跳过误判。
+    """
+    exact: set[str] = {cfg.proxy.server.lower()}
+    suffix: set[str] = set()
+    nets: list = []
+    m = split_entries(cfg.routing.isolation_allowlist)
+    for e in m.get("domain", []):          # full:example.com -> 只匹配它本身
+        exact.add(e)
+    for e in m.get("domain_suffix", []):   # example.com -> 匹配它和子域
+        suffix.add(e)
+    for e in m.get("ip_cidr", []):
+        try:
+            nets.append(ipaddress.ip_network(e, strict=False))
+        except ValueError:
+            pass
+    return exact, suffix, nets
+
+
+def is_exempt(host: str | None, exempt: tuple[set[str], set[str], list]) -> bool:
+    """探测目标是否落在修复窗口的额外放行范围内。"""
+    if not host:
+        return False
+    exact, suffix, nets = exempt
+    h = host.lower()
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        return any(addr in n for n in nets)
+    if h in exact:
+        return True
+    return any(h == d or h.endswith("." + d) for d in suffix)
 
 
 def complement(nets: list, version: int) -> list[tuple[str, str]]:

@@ -96,34 +96,46 @@ def test_proxy_only_excludes_addresses_that_could_fake_recovery(env):
     assert "203.0.113.7/32" in allowed
     assert notes["resolved"]["proxy.example.test"] == ["203.0.113.7"]
 
-    # 蓝名单和监控目标不能放行：它们会让 monitor.verify 误判成「已恢复」
-    assert "198.51.100.9/32" not in allowed
-    assert "10.9.9.9/32" not in allowed
-    for net in v4 + v6:
-        for host, ips in notes["resolved"].items():
-            if host != "proxy.example.test":
-                assert str(net) not in [f"{ip}/32" for ip in ips]
+    # 蓝名单放行：修复可能持续到人工介入，这时连蓝名单一起断掉违背它存在的意义
+    assert "198.51.100.9/32" in allowed      # blue.example.test
+    assert "10.9.9.9/32" in allowed          # 蓝名单里的 IP 段
+
+    # 但国内 DNS 和监控探测目标仍然不放行
+    assert "223.5.5.5/32" not in allowed
 
     # 回环等固定项仍在
     assert "127.0.0.0/8" in allowed
+
+
+def test_proxy_only_still_narrower_than_full(env):
+    """修复窗口比完整范围窄：监控探测目标仍然被挡住。"""
+    _, cfg, _ = env
+    narrow_v4, narrow_v6, _ = block.proxy_only(cfg)
+    narrow = {str(n) for n in narrow_v4 + narrow_v6}
+    from norain import defaults
+    # 默认监控探测目标（baidu/qq/taobao）的解析结果不应出现在修复窗口里
+    assert all("baidu" not in x for x in narrow)
+    assert len(narrow) < len({str(n) for n in block.allowed(cfg)[0] + block.allowed(cfg)[1]}) + 10
 
 
 def test_proxy_only_records_unresolved_proxy(env, monkeypatch):
     _, cfg, _ = env
     monkeypatch.setattr(block, "_resolve", lambda host: [])
     _, _, notes = block.proxy_only(cfg)
-    assert notes["unresolved"] == ["proxy.example.test"]
+    # 代理服务器解析不出来时必须记录：收紧放行范围时要靠它决定是否放弃
+    assert "proxy.example.test" in notes["unresolved"]
     assert notes["resolved"] == {}
 
 
 def test_full_allowed_is_a_superset_of_proxy_only(env):
     _, cfg, _ = env
-    full_v4, full_v6, _ = block.allowed(cfg)
-    narrow_v4, narrow_v6, _ = block.proxy_only(cfg)
-    full = {str(n) for n in full_v4 + full_v6}
-    narrow = {str(n) for n in narrow_v4 + narrow_v6}
-    assert narrow <= full or all(
-        any(ipaddress.ip_network(x).subnet_of(ipaddress.ip_network(f)) for f in full) for x in narrow)
+    full = {str(n) for n in block.allowed(cfg)[0] + block.allowed(cfg)[1]}
+    narrow = {str(n) for n in block.proxy_only(cfg)[0] + block.proxy_only(cfg)[1]}
+    # 修复窗口应当是完整范围的子集（同版本才比较）
+    for x in narrow:
+        net = ipaddress.ip_network(x)
+        assert any(net.subnet_of(ipaddress.ip_network(f))
+                   for f in full if ipaddress.ip_network(f).version == net.version), x
 
 
 # ---- 2. engage / tighten ---------------------------------------------------------
@@ -134,7 +146,7 @@ def test_engage_repairing_uses_narrow_scope(env):
     assert st["repairing"] is True
     assert st["active"] is True
     assert "203.0.113.7/32" in st["allowed"]
-    assert "198.51.100.9/32" not in st["allowed"]
+    assert "198.51.100.9/32" in st["allowed"]     # 蓝名单在修复窗口里也放行
     # 先落盘再应用：apply 之前状态文件已经存在
     assert block.is_active(paths)
     assert be.calls.count("apply") == 1  # apply 内部自己循环 v4/v6 和分块
@@ -235,6 +247,80 @@ def test_release_force_clears_broken_state(env):
     block.write_json(paths.block_state, {"active": False, "broken": True, "rules": []})
     block.release(paths, force=True)
     assert block.state(paths) is None
+
+
+# ---- 5. 修复窗口的豁免判定（蓝名单放行后必须让 verify 忽略它们） -----------------
+
+def _rnd(dom, frn, *, p4="US", p6="US", d4="CN"):
+    from norain.monitor import Round
+    loc = lambda c: {"ip": "x", "loc": c} if c else None
+    return Round(at=0, domestic=[{"ok": o, "target": t} for o, t in dom],
+                 foreign=[{"ok": o, "target": t} for o, t in frn],
+                 direct_v4=loc(d4), proxy_v4=loc(p4), proxy_v6=loc(p6), dns_home=None)
+
+
+def test_exempt_hosts_matches_blue_list_semantics(env):
+    _, cfg, _ = env
+    exempt = block.exempt_hosts(cfg)
+    exact, suffix, nets = exempt
+    # proxy.example.test 和 blue.example.test 都进了放行范围
+    assert block.is_exempt("proxy.example.test", exempt)
+    assert block.is_exempt("blue.example.test", exempt)
+    assert block.is_exempt("sub.blue.example.test", exempt)
+    assert block.is_exempt("10.9.9.9", exempt)          # 蓝名单里的 CIDR
+    assert not block.is_exempt("www.baidu.com", exempt)  # 监控目标不在豁免里
+    assert not block.is_exempt("1.1.1.1", exempt)
+    assert not block.is_exempt(None, exempt)
+
+
+def test_drop_exempt_detects_faked_recovery(env):
+    """国内探测全是蓝名单地址：它们能通不代表代理修好，必须判失败。"""
+    from norain.monitor import _drop_exempt
+    _, cfg, _ = env
+    exempt = block.exempt_hosts(cfg)
+    B = "https://blue.example.test"
+    G = "https://www.google.com"
+    r = _rnd([(True, B)] * 3, [(False, G)] * 4, p4=None, p6=None)
+    code, _reason = _drop_exempt(r, "CN", exempt)
+    assert code != 0
+
+
+def test_drop_exempt_no_match_keeps_original(env):
+    from norain.monitor import _drop_exempt
+    _, cfg, _ = env
+    exempt = block.exempt_hosts(cfg)
+    r = _rnd([(True, "https://www.baidu.com")] * 3, [(True, "https://www.google.com")] * 4)
+    assert _drop_exempt(r, "CN", exempt) == (r.code, r.reason)
+
+
+def test_drop_exempt_none_is_noop(env):
+    from norain.monitor import _drop_exempt
+    r = _rnd([(True, "https://blue.example.test")], [(False, "https://www.google.com")])
+    assert _drop_exempt(r, "CN", None) == (r.code, r.reason)
+
+
+def test_drop_exempt_passes_when_real_targets_ok(env):
+    """剔除蓝名单探测项后，剩下的真实目标都正常才允许判定恢复。"""
+    from norain.monitor import _drop_exempt
+    _, cfg, _ = env
+    exempt = block.exempt_hosts(cfg)
+    B = "https://blue.example.test"
+    dom = [(True, B), (True, "https://www.baidu.com"), (True, "https://www.qq.com")]
+    frn = [(True, "https://www.google.com")] * 4
+    code, _ = _drop_exempt(_rnd(dom, frn), "CN", exempt)
+    assert code == 0
+
+
+def test_drop_exempt_insufficient_samples_fails(env):
+    """剩余样本不足时不能判恢复，否则「没证据」会被当成「已恢复」。"""
+    from norain.monitor import _drop_exempt
+    _, cfg, _ = env
+    exempt = block.exempt_hosts(cfg)
+    B = "https://blue.example.test"
+    # 国外项全被豁免，只剩国内
+    r = _rnd([(True, B)], [(True, B)], p4=None, p6=None)
+    code, _ = _drop_exempt(r, "CN", exempt)
+    assert code != 0
 
 
 # ---- 4. Maintainer 流程 ----------------------------------------------------------

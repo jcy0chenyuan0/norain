@@ -322,7 +322,10 @@ class Controller:
     def verify(self, rounds: int) -> int:
         if not self.cfg.monitor.enabled:
             return OK if self.proxy.ready else maintain.PROXY_DOWN
-        return self.monitor.verify(rounds)
+        # 阻断修复期间蓝名单被额外放行：让监控跳过这些探测项，免得把「蓝名单还能通」
+        # 当成「代理已经修好」
+        exempt = block.exempt_hosts(self.cfg) if block.is_active(self.paths) else None
+        return self.monitor.verify(rounds, exempt=exempt)
 
     def enter_repair(self, code: int) -> None:
         self.phase = REPAIRING

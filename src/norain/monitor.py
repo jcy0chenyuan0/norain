@@ -22,6 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable
+from urllib.parse import urlsplit
 
 from norain_core.log import Logger
 
@@ -232,17 +233,23 @@ class Monitor:
                 self.on_change(self.code, rnd)
         return rnd
 
-    def verify(self, rounds: int, *, gap: float = 1.0) -> int:
+    def verify(self, rounds: int, *, gap: float = 1.0, exempt: tuple[set[str], set[str], list] | None = None) -> int:
         """修复之后的验证：连续快速检测几轮，全部正常才算通过。返回最后看到的原始错误码。
-        不经过去抖动，也不触发回调（调用方就是处理故障的那一方）。"""
+        不经过去抖动，也不触发回调（调用方就是处理故障的那一方）。
+
+        exempt：修复窗口里被额外放行的域名和网段（block.exempt_hosts）。这些地址在阻断
+        期间仍然可达，但它们通只说明「蓝名单没被断」，不说明代理修好了。所以判定前先把
+        落在其中的探测项剔除，再用剩下的重新判；剔除后没有任何探测项就视为没修好。
+        """
         code = OK
         for i in range(max(rounds, 1)):
             with self._lock:
                 rnd = run_round(self.cfg, self.ports_fn(), self.geo)
                 self.last = rnd
                 self.rounds += 1
-            code = rnd.code
+            code, reason = _drop_exempt(rnd, self.cfg.monitor.home_country, exempt)
             if code != OK:
+                self.log.debug("monitor.verify_failed", code=code, reason=reason)
                 return code
             if i + 1 < rounds and self._stop.wait(gap):
                 break
@@ -290,6 +297,50 @@ class Monitor:
         return {"state": ("paused" if self.paused else "running") if self.alive() else "stopped",
                 "code": self.code, "meaning": MEANING.get(self.code, ""), "rounds": self.rounds,
                 "last_result": self.last.as_dict() if self.last else None}
+
+
+def _host_of(target: str) -> str | None:
+    """从探测目标（URL）里取出主机名。"""
+    try:
+        return urlsplit(target).hostname
+    except ValueError:
+        return None
+
+
+def _drop_exempt(rnd: Round, home: str, exempt: tuple[set[str], set[str], list] | None) -> tuple[int, str]:
+    """剔除修复窗口里被额外放行的探测项，再重新判定错误码。
+
+    exempt 为空时等价于直接返回 rnd.code，不引入任何新行为。
+
+    不能简单地把剔除后的结果再喂给 decide()：decide 的几条规则都以「列表非空」为前提，
+    空列表会让条件整体落空、走到最后的 return OK，等于把「没证据」当成「已恢复」。
+    所以这里先显式要求剩下的探测项足以支撑判定，不够就直接判失败。
+    """
+    if not exempt:
+        return rnd.code, rnd.reason
+    from .block import is_exempt
+
+    keep_dom = [r for r in rnd.domestic if not is_exempt(_host_of(r.get("target", "")), exempt)]
+    keep_frn = [r for r in rnd.foreign if not is_exempt(_host_of(r.get("target", "")), exempt)]
+    if len(keep_dom) == len(rnd.domestic) and len(keep_frn) == len(rnd.foreign):
+        return rnd.code, rnd.reason   # 没有命中放行范围，按原样判定
+
+    def majority_ok(rows: list[dict]) -> bool:
+        return bool(rows) and sum(r["ok"] for r in rows) * 2 >= len(rows)
+
+    # 两类探测项都必须剩下足够样本，否则「能不能通」无从判断
+    if not keep_dom or not keep_frn:
+        return 600, ("修复期间大部分探测目标落在放行范围内，剩余样本不足以判断代理是否已恢复")
+    if not (majority_ok(keep_dom) and majority_ok(keep_frn)):
+        return 600, "剔除放行范围内的探测项后，仍有大部分探测目标无法访问"
+
+    trimmed = Round(
+        at=rnd.at, domestic=keep_dom, foreign=keep_frn,
+        direct_v4=rnd.direct_v4, proxy_v4=rnd.proxy_v4, proxy_v6=rnd.proxy_v6,
+        dns_home=None,   # 蓝名单会影响本地 DNS 解析结果，不采信它
+    )
+    code, reason = decide(trimmed, home)
+    return code, (reason + "（已忽略仅因放行范围可达的探测项）" if reason else reason)
 
 
 def report_text(rnd: Round) -> str:
