@@ -249,6 +249,57 @@ def test_release_force_clears_broken_state(env):
     assert block.state(paths) is None
 
 
+def test_release_is_allowed_during_repairing(env):
+    """修复窗口里用户主动解除，必须放行：解除的合法性取决于用户意图，不是代理状态。
+
+    把流量锁死在一个可能永远修不好的状态里，比让用户看到真实 IP 更糟。
+    """
+    paths, cfg, be = env
+    block.engage(cfg, paths, code=600, reason="t", repairing=True)
+    assert block.state(paths)["repairing"] is True
+    res = block.release(paths)
+    assert res["was_active"] is True
+    assert block.state(paths) is None
+
+
+def test_release_is_allowed_after_tighten(env):
+    """tighten 成功但 release 失败后，用户再执行 block off 不应被拦下。"""
+    paths, cfg, be = env
+    block.engage(cfg, paths, code=600, reason="t", repairing=True)
+    block.tighten(paths)
+    assert block.state(paths)["repairing"] is False
+    res = block.release(paths)
+    assert res["was_active"] is True
+
+
+def test_release_failure_after_tighten_warns_user(env):
+    """tighten 成功后 release 失败：必须弹窗告诉用户网络为什么还断着。
+
+    否则代理明明修好了、网络却还是断的，用户只会以为 norain 坏了。
+    """
+    paths, cfg, be = env
+    block.engage(cfg, paths, code=600, reason="t", repairing=True)
+    block.tighten(paths)
+
+    pops = []
+    m = maintain.Maintainer.__new__(maintain.Maintainer)
+    m.log = _Log()
+    orig = block.release
+
+    def failing_release(*a, **kw):
+        raise NorainError("删规则失败", exit_code=EXIT_EXTERNAL, module="block")
+
+    try:
+        block.release = failing_release
+        block.osutil.popup = lambda title, text: pops.append((title, text)) or True
+        m._unblock_after_repair(paths)
+    finally:
+        block.release = orig
+
+    assert pops, "release 失败后必须弹窗"
+    assert m.log.has("maintain.unblock_failed")
+
+
 # ---- 5. 修复窗口的豁免判定（蓝名单放行后必须让 verify 忽略它们） -----------------
 
 def _rnd(dom, frn, *, p4="US", p6="US", d4="CN"):

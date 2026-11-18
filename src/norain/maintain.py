@@ -241,7 +241,12 @@ class Maintainer:
             block.release(paths, log=self.log)
             self.log.info("maintain.unblocked", note="修复成功，已恢复正常网络")
         except NorainError as e:
+            # 代理已修好、放行范围也收回了，但规则没删掉 —— 用户会以为 norain 坏了，
+            # 必须明确告诉他网络为什么还断着、怎么手工恢复
             self.log.error("maintain.unblock_failed", error=e.message, hint=e.hint)
+            osutil.popup("Norain：代理已修复，但网络仍未恢复",
+                         f"代理已经恢复，但删除阻断规则失败：{e.message}\n"
+                         + (e.hint or "") + "\n在管理员终端运行 norain block off 重试。")
 
     # ---- 模块生命周期 ----
 

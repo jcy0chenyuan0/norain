@@ -428,8 +428,12 @@ def _nets_from(allowed_strs: list[str]) -> tuple[list, list]:
 def release(paths: Paths, *, log: Logger | None = None, force: bool = False) -> dict:
     """解除阻断，恢复正常的防火墙放行。幂等：没有状态文件时也会清理残留规则。
 
-    只有一种情况拒绝解除：状态被标记为 broken（收紧放行范围失败，系统里可能已经没有
-    阻断规则了）。这时必须先人工确认，否则「解除成功」是一种误导。
+    守卫只看一种情况：状态被标记为 broken（收紧放行范围失败，系统里可能已经没有
+    阻断规则了），这时必须先人工确认，否则「解除成功」是一种误导。
+
+    刻意**不**用 repairing 当守卫：解除阻断的合法性取决于用户意图，而不是代理是否
+    修好。修复窗口里用户想解除，就应当解除 —— 把流量锁死在一个可能永远修不好的状态
+    里，比让他看到真实 IP 更糟。
     """
     st = state(paths) or {}
     be = backend()
