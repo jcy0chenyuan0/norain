@@ -15,8 +15,9 @@ pip install norain
 
 同一个包提供两个命令：`norain`（客户端）和 `norain-server`（服务端）。
 
-**当前状态：0.2.2。两端模块代码齐备；测试套件在 Windows 上 127 项通过（3 项仅 POSIX 跳过）。
-已在真实环境验证过的部分**：生成配置通过真实 `sing-box 1.14.4 check`、本地端到端隧道、TUN 路由接管与还原、
+**当前版本为 0.2.3。** Windows 全量测试 176 项通过（3 项仅 POSIX 跳过）。
+
+已在真实环境验证过的部分包括生成配置通过 `sing-box 1.14.4 check`、本地端到端隧道、TUN 路由接管与还原、
 Windows 防火墙阻断与解除、nftables 阻断、系统代理写入与还原、服务端 install/reload/fix/update/uninstall、
 systemd 开机自启（真实重启）、真实 ACME 签发。**仍未验证**：客户端与 Linux 的安装流程、TUN 的实际流量、
 监控错误码、自维持互拉、分流学习闭环。逐项见 [docs/pending.md](docs/pending.md)。
