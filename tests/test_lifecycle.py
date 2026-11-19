@@ -9,9 +9,10 @@ import time
 import psutil
 import pytest
 
+from norain_core.errors import NorainError
 from norain_server.service import SystemdBackend, UNIT
 
-from conftest import PASSWORD
+from conftest import PASSWORD, free_port
 
 
 def wait_for(fn, timeout=15):
@@ -115,6 +116,65 @@ def test_start_refuses_bad_config_and_port_in_use(server):
 
 
 @pytest.mark.slow
+def test_reload_moves_to_new_port_without_killing_daemon(server):
+    """重载换了端口之后，守护进程不能还在检查旧端口——那会一路重启到上限并退出。"""
+    assert server.cli("start").returncode == 0
+    server.trojan_port = free_port()
+    server.write_config()
+    r = server.cli("reload", "--json")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["reloaded"] is True
+    st = wait_for(lambda: (s := server.status())["process"]["running"] and s)
+    assert st["service"]["state"] == "running"
+    assert st["business_code"] == 0
+    with socket.create_connection(("127.0.0.1", server.trojan_port), timeout=3):
+        pass   # 新端口在监听
+    time.sleep(3)   # 跨过至少两个健康检查周期
+    st = server.status()
+    assert st["service"]["state"] == "running" and st["business_code"] == 0
+
+
+def test_reload_refuses_occupied_port_without_replacing_running_config(server):
+    assert server.cli("start").returncode == 0
+    old = server.status()
+    run = server.state / "run" / "sing-box.json"
+    active = run.read_bytes()
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        server.trojan_port = busy.getsockname()[1]
+        server.write_config()
+        result = server.cli("reload", "--json")
+        assert result.returncode != 0
+        assert json.loads(result.stdout)["business_code"] == 130
+    assert run.read_bytes() == active
+    assert server.status()["process"]["pid"] == old["process"]["pid"]
+
+
+def test_rollback_restart_uses_saved_runtime_instead_of_edited_toml(server, monkeypatch):
+    from norain_server import runner
+    from norain_server.paths import Paths
+
+    paths = Paths.from_env()
+    prep = runner.prepare(paths)
+    saved = paths.current_json.read_bytes()
+    saved_meta = paths.meta_json.read_bytes()
+    old_port = server.trojan_port
+    server.trojan_port = free_port()
+    server.write_config()
+    runner.restore_runtime(paths, saved, saved_meta)
+
+    def run(supervisor):
+        assert ("127.0.0.1", "tcp", old_port) in supervisor.spec.listeners
+        assert supervisor.spec.config_version == prep.applied.version
+        assert paths.current_json.read_bytes() == saved
+        return 0
+
+    monkeypatch.setattr(runner.Supervisor, "run", run)
+    assert runner.run_foreground(paths) == 0
+
+
+@pytest.mark.slow
 def test_restart_keeps_old_process_when_new_config_invalid(server):
     assert server.cli("start").returncode == 0
     pid = server.status()["process"]["pid"]
@@ -149,12 +209,37 @@ def test_systemd_backend_with_fake_systemctl(server):
         return subprocess.CompletedProcess(args, rc, out, "Access denied" if rc else "")
 
     b = SystemdBackend(Paths.from_env(), run)
-    b.start()
-    assert calls == [["systemctl", "reset-failed", UNIT], ["systemctl", "start", UNIT]]
+    # systemctl start 返回 0 但服务其实是 failed：不能报成功
+    with pytest.raises(NorainError) as exc:
+        b.start()
+    assert "没有在运行" in exc.value.message
+    assert [c[1] for c in calls] == ["reset-failed", "start", "show"]
     st = b.status()
     assert st.state == "failed" and st.outer_restarts == 2
     try:
         b.stop()
         raise AssertionError
-    except Exception as e:
+    except NorainError as e:
         assert e.exit_code == 4
+    assert calls[-1] == ["systemctl", "stop", UNIT]
+
+
+def test_systemd_backend_start_requires_ready_child(server, monkeypatch):
+    from norain_server.paths import Paths
+    from norain_server import service
+
+    calls = []
+
+    def run(args):
+        calls.append(args[1])
+        out = "ActiveState=active\nMainPID=42\nNRestarts=0\n" if args[1] == "show" else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    b = SystemdBackend(Paths.from_env(), run)
+    with pytest.raises(NorainError, match="未就绪"):
+        b.start(timeout=0)
+    assert calls[-1] == "stop"
+    monkeypatch.setattr(service, "runner_info", lambda path: {"pid": 42, "ready": True, "child_pid": 43})
+    monkeypatch.setattr(service, "alive", lambda pid: pid == 43)
+    b.start()
+    assert b.status().state == "running"

@@ -13,6 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+from norain_core import _winconsole
+
 READY_TIMEOUT = 10.0   # 超过这个时间还起不来就算失败，避免测试无限挂住
 READY_INTERVAL = 0.02
 
@@ -45,20 +47,21 @@ def wait_for(predicate, *, timeout: float = 3.0, interval: float = 0.02) -> bool
 class RunningSingBox:
     """启动一个 sing-box，提供就绪等待、日志收集与停止。"""
 
-    def __init__(self, binary: str, config: Path, *, ready_ports: tuple[int, ...] = ()):
+    def __init__(self, binary: str, config: Path, *, ready_ports: tuple[int, ...] = (),
+                 windows_console: bool = False):
         self.binary = binary
         self.config = config
         self.ready_ports = ready_ports
+        self.windows_console = os.name == "nt" and windows_console
         self.proc: subprocess.Popen | None = None
         self.logs: list[str] = []
-        self._reader: threading.Thread | None = None
 
     def start(self) -> "RunningSingBox":
+        options = _winconsole.hidden_console_options() if self.windows_console else {}
         self.proc = subprocess.Popen([self.binary, "run", "-c", str(self.config)],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, errors="replace")
-        self._reader = threading.Thread(target=self._pump, daemon=True)
-        self._reader.start()
+                                     text=True, errors="replace", **options)
+        threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
         for port in self.ready_ports:
             if not wait_port(port):
                 tail = "".join(self.logs[-20:])
@@ -66,20 +69,24 @@ class RunningSingBox:
                 raise RuntimeError(f"sing-box 没有在超时内监听 {port}\n--- 最近的日志 ---\n{tail}")
         return self
 
-    def _pump(self):
-        assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
+    def _pump(self, proc: subprocess.Popen):
+        assert proc.stdout is not None
+        for line in proc.stdout:
             self.logs.append(line)
 
-    def stop(self):
-        """先 terminate，超时再 kill；两种情况都等到进程真的退出，避免留下僵尸。"""
+    def stop(self) -> bool:
+        """请求退出并等待进程结束，返回 sing-box 是否正常退出。"""
         if not self.proc:
-            return
+            return False
         proc = self.proc
         self.proc = None
         try:
-            proc.terminate()
-            proc.wait(5)
+            if proc.poll() is not None:
+                return False
+            interrupted = self.windows_console and _winconsole.request_interrupt(proc.pid)
+            if not interrupted:
+                proc.terminate()
+            return proc.wait(10) == 0 and (interrupted or os.name != "nt")
         except subprocess.TimeoutExpired:
             proc.kill()
             # kill 之后必须再 wait，否则 Windows 上句柄和进程都可能残留
@@ -89,6 +96,7 @@ class RunningSingBox:
             if proc.stdout is not None:
                 with contextlib.suppress(OSError, ValueError):
                     proc.stdout.close()
+        return False
 
     def __enter__(self):
         return self.start()

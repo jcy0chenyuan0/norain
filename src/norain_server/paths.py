@@ -67,6 +67,8 @@ class Paths:
     @property
     def reload_file(self) -> Path: return self.run_dir / "reload-request"
     @property
+    def recovery_file(self) -> Path: return self.run_dir / "use-current-config"
+    @property
     def firewall_state(self) -> Path: return self.state / "firewall.json"
     @property
     def acme_dir(self) -> Path: return self.state / "acme"

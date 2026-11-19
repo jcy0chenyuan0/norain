@@ -9,12 +9,14 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from typing import Callable
 
 from norain_core import osutil
-from norain_core.daemonctl import DetachedBackend, ServiceStatus, runner_info
-from norain_core.errors import EXIT_EXTERNAL, EXIT_PERMISSION, NorainError
+from norain_core.daemonctl import DetachedBackend, ServiceStatus, alive, runner_info
+from norain_core.errors import EXIT_EXTERNAL, EXIT_PERMISSION, EXIT_TIMEOUT, NorainError
 from norain_core.redact import redact
+from norain_core.state import read_json
 
 from .paths import Paths
 
@@ -60,6 +62,22 @@ class SystemdBackend:
     def start(self, *, timeout: float = 20.0) -> None:
         self._run(["systemctl", "reset-failed", UNIT])
         self._ctl("start")
+        deadline = time.monotonic() + timeout
+        while True:
+            st = self.status()
+            if st.state != "running":
+                error = read_json(self.paths.last_error) or {}
+                raise NorainError(
+                    f"服务没有在运行（状态为 {st.state}）：{error.get('message', '请检查服务日志')}",
+                    exit_code=EXIT_EXTERNAL, module="daemon", hint="检查 journalctl -u norain-server")
+            info = runner_info(self.paths.runner)
+            if st.pid and info.get("pid") == st.pid and info.get("ready") and alive(info.get("child_pid")):
+                return
+            if time.monotonic() >= deadline:
+                self.stop()
+                raise NorainError("启动超时：sing-box 未就绪，服务已停止", exit_code=EXIT_TIMEOUT,
+                                  module="daemon", hint="检查 journalctl -u norain-server")
+            time.sleep(0.1)
 
     def stop(self, *, timeout: float = 20.0) -> None:
         self._ctl("stop")

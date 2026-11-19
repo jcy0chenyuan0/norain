@@ -3,7 +3,7 @@
 - 启动 sing-box，定时检查进程、端口监听和 fatal 日志；
 - 异常时重启，连续重启超过上限后以 EXIT_RESTART_LIMIT 退出；
 - 停止请求有两种来源：停止请求文件（跨平台）和 SIGTERM/SIGINT（POSIX）。
-  Windows 上向进程发信号等于强制结束，所以必须用停止请求文件才能干净退出。
+  Windows 上的 fake-ip 客户端使用独立控制台退出，让 sing-box 保存缓存。
 - 重载请求（重载请求文件或 request_reload()）：重启子进程以加载新配置，不计入失败次数。
 """
 
@@ -18,12 +18,13 @@ import socket
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
 import psutil
 
+from . import _winconsole
 from .errors import (BIZ_PORT_IN_USE, BIZ_PROCESS_EXITED, BIZ_RESTART_LIMIT, EXIT_EXTERNAL,
                      EXIT_OK, EXIT_PERMISSION, EXIT_RESTART_LIMIT, NorainError)
 from .log import Logger, RotatingFile
@@ -55,7 +56,10 @@ class Spec:
     last_error_file: Path
     stop_file: Path
     reload_file: Path | None = None                 # 出现该文件时重启子进程（不计失败）
+    resolve_listeners: Callable[[], list[Listener]] | None = None
+    # 重载后按磁盘上的最新配置重新计算监听端口；不提供时沿用启动时的 listeners
     on_line: Callable[[str], None] | None = None    # 每行（已脱敏的）sing-box 输出的回调
+    windows_console: bool = False                  # 用独立控制台给 sing-box 发送 Ctrl+C
 
 
 def check_ports_free(listeners: list[Listener]) -> None:
@@ -183,8 +187,7 @@ class Supervisor:
                 except Exception:  # noqa: BLE001 回调出错不能中断日志泵
                     pass
 
-    @staticmethod
-    def _terminate(child: subprocess.Popen) -> None:
+    def _terminate(self, child: subprocess.Popen) -> None:
         # 先记下整棵子孙树：Windows 上子进程可能是个启动器（.cmd、包装脚本、
         # 安装器壳）。即使启动器已经退出，真正的进程也可能还占着端口。
         try:
@@ -192,10 +195,12 @@ class Supervisor:
         except (psutil.Error, OSError):
             procs = []
         if child.poll() is None:
-            try:
-                child.terminate()
-            except OSError:
-                pass
+            interrupted = self.spec.windows_console and os.name == "nt" and _winconsole.request_interrupt(child.pid)
+            if not interrupted:
+                try:
+                    child.terminate()
+                except OSError:
+                    pass
             try:
                 child.wait(STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
@@ -235,6 +240,17 @@ class Supervisor:
             except OSError:
                 if attempt == 1:
                     time.sleep(0.1)
+
+    def _refresh_listeners(self, log: Logger) -> Spec | None:
+        """重新计算监听端口并返回新的 Spec；算不出来时沿用当前 Spec（并留下告警）。"""
+        if self.spec.resolve_listeners is None:
+            return None
+        try:
+            listeners = self.spec.resolve_listeners()
+        except Exception as e:  # noqa: BLE001 配置坏了要留给子进程报错，不能把守护进程也带崩
+            log.warn("health.listeners_unknown", error=redact(str(e)))
+            return None
+        return replace(self.spec, listeners=listeners)
 
     def _config_version(self) -> str:
         """重载后配置文件内容会变，版本号以磁盘上的当前配置为准。"""
@@ -299,11 +315,16 @@ class Supervisor:
         consecutive = 0
         popen_extra = {}
         if os.name == "nt":
-            popen_extra["creationflags"] = subprocess.CREATE_NO_WINDOW
+            popen_extra = (_winconsole.hidden_console_options() if spec.windows_console
+                           else {"creationflags": subprocess.CREATE_NO_WINDOW})
         try:
             while True:
                 self._fatal = None
-                self._reload_requested()   # 马上要用最新配置启动：之前积压的重载请求已经满足
+                # 退避中也可能收到重载请求，下一次启动必须按实际 JSON 更新监听端口。
+                if self._reload_requested():
+                    refreshed = self._refresh_listeners(log)
+                    if refreshed:
+                        spec = self.spec = refreshed
                 child = subprocess.Popen(
                     [str(spec.binary), "run", "-c", str(spec.config_json)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -324,6 +345,11 @@ class Supervisor:
                     return EXIT_OK
                 if reason == RELOAD:
                     log.info("singbox.reloading")
+                    # 重载可能改了端口：新子进程用新配置，健康检查也必须看新端口，
+                    # 否则会一直报「旧端口没有在监听」直到耗尽重启次数退出。
+                    refreshed = self._refresh_listeners(log)
+                    if refreshed:
+                        spec = self.spec = refreshed   # _supervise 读的是 self.spec
                     consecutive = 0
                     continue
 

@@ -13,7 +13,6 @@
 """
 
 import json
-import os
 import socket
 import threading
 import time
@@ -24,6 +23,7 @@ import pytest
 from norain import generate
 from norain.model import load_config
 from norain.paths import Paths
+from norain_core.secrets import Secret
 
 from harness_singbox import RunningSingBox, check_config, find_singbox, wait_for
 
@@ -80,14 +80,17 @@ class _Upstream:
         qtype = int.from_bytes(data[i:i + 2], "big")
         question = data[12:i + 4]
         self.queried.append(".".join(labels))
-        if qtype == 1:
+        if qtype in (1, 16, 28):
             ip = self.answers.get(".".join(labels), "203.0.113.99")
-            ans = (b"\xc0\x0c" + b"\x00\x01" + b"\x00\x01" + (60).to_bytes(4, "big")
-                   + (4).to_bytes(2, "big") + socket.inet_aton(ip))
+            rdata = {1: socket.inet_aton(ip),
+                     16: b"\x07fixture",
+                     28: socket.inet_pton(socket.AF_INET6, "2001:db8::123")}[qtype]
+            ans = (b"\xc0\x0c" + qtype.to_bytes(2, "big") + b"\x00\x01" + (60).to_bytes(4, "big")
+                   + len(rdata).to_bytes(2, "big") + rdata)
             resp = (qid + b"\x81\x80" + (1).to_bytes(2, "big") + (1).to_bytes(2, "big")
                     + b"\x00\x00" * 2 + question + ans)
         else:
-            resp = (qid + b"\x81\x80" + (0).to_bytes(2, "big") + (0).to_bytes(2, "big")
+            resp = (qid + b"\x81\x80" + (1).to_bytes(2, "big") + (0).to_bytes(2, "big")
                     + b"\x00\x00" * 2 + question)
         self.sock.sendto(resp, addr)
 
@@ -165,6 +168,7 @@ mode = "split"
 domestic = "127.0.0.1"
 fake_ip = true
 fake_ip_range = "198.18.0.0/15"
+fake_ip_range_v6 = "__V6__"
 [routing]
 proxy_domains = ["proxy.example"]
 direct_domains = ["direct.example"]
@@ -174,8 +178,9 @@ direct_domains = ["direct.example"]
 class _Env:
     """一个模块内共用的 fake_ip 环境。"""
 
-    def __init__(self, tmp: Path):
+    def __init__(self, tmp: Path, *, ipv6_range: str = ""):
         self.tmp = tmp
+        self.ipv6_range = ipv6_range
         self.dns_in = _free_port()
         self.mixed = _free_port()
         self.upstream = _Upstream({"proxy.example": "203.0.113.11",
@@ -183,20 +188,18 @@ class _Env:
                                    "other.example": "203.0.113.33"})
         self.socks = _SocksCatcher()
         self.singbox: RunningSingBox | None = None
-        self._saved_env: str | None = None
 
     def start(self):
-        # 凭证引用要读环境变量；记下原值，stop() 里恢复，别污染后面的测试
-        self._saved_env = os.environ.get("NORAIN_TEST_PW")
-        os.environ["NORAIN_TEST_PW"] = "pw1234567890"
         cfgp = self.tmp / "cfg.toml"
-        cfgp.write_text(CFG.replace("__MIXED__", str(self.mixed)), encoding="utf-8")
+        cfgp.write_text(CFG.replace("__MIXED__", str(self.mixed)).replace("__V6__", self.ipv6_range),
+                        encoding="utf-8")
         cfg = load_config(cfgp)
         paths = Paths(home=self.tmp, config=cfgp, state=self.tmp / "state",
                       log_dir=self.tmp / "log", log_dir_from_env=False, singbox=None,
                       platform="nt")
         (self.tmp / "state").mkdir(exist_ok=True)
-        doc = json.loads(generate.render(cfg, generate.resolve_secret(cfg), paths))
+        secret = Secret(value="pw1234567890", source="test")
+        doc = json.loads(generate.render(cfg, secret, paths))
 
         doc["inbounds"] = [
             {"type": "mixed", "tag": "tun-in", "listen": "127.0.0.1", "listen_port": self.mixed},
@@ -221,7 +224,8 @@ class _Env:
         cp = self.tmp / "sing-box.json"
         cp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         check_config(SB, cp)
-        self.singbox = RunningSingBox(SB, cp, ready_ports=(self.mixed, self.dns_in)).start()
+        self.singbox = RunningSingBox(SB, cp, ready_ports=(self.mixed, self.dns_in),
+                                     windows_console=True).start()
         return self
 
     def stop(self):
@@ -229,11 +233,6 @@ class _Env:
             self.singbox.stop()
         self.upstream.close()
         self.socks.close()
-        # 恢复环境变量，避免污染同进程里后续的测试
-        if self._saved_env is None:
-            os.environ.pop("NORAIN_TEST_PW", None)
-        else:
-            os.environ["NORAIN_TEST_PW"] = self._saved_env
 
     def restart(self):
         """只重启 sing-box 进程，配置文件与 cache_file 都沿用。
@@ -241,15 +240,16 @@ class _Env:
         用来验证 cache_file 是否真的把「假 IP -> 域名」映射持久化了。
         """
         assert self.singbox is not None
-        self.singbox.stop()
+        assert self.singbox.stop(), "sing-box 未正常退出，无法验证重启后的 fake-IP 缓存"
         cp = self.tmp / "sing-box.json"
-        self.singbox = RunningSingBox(SB, cp, ready_ports=(self.mixed, self.dns_in)).start()
+        self.singbox = RunningSingBox(SB, cp, ready_ports=(self.mixed, self.dns_in),
+                                     windows_console=True).start()
 
-    def resolve(self, name: str) -> str | None:
+    def resolve(self, name: str, *, qtype: int = 1) -> str | None:
         pkt = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
         for part in name.split("."):
             pkt += bytes([len(part)]) + part.encode()
-        pkt += b"\x00\x00\x01\x00\x01"
+        pkt += b"\x00" + qtype.to_bytes(2, "big") + b"\x00\x01"
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(4)
         try:
@@ -274,8 +274,13 @@ class _Env:
             rdlen = int.from_bytes(data[i + 8:i + 10], "big")
             rdata = data[i + 10:i + 10 + rdlen]
             i += 10 + rdlen
-            if rtype == 1 and len(rdata) == 4:
-                return socket.inet_ntoa(rdata)
+            if rtype == qtype:
+                if rtype == 1 and rdlen == 4:
+                    return socket.inet_ntop(socket.AF_INET, rdata)
+                if rtype == 28 and rdlen == 16:
+                    return socket.inet_ntop(socket.AF_INET6, rdata)
+                if rtype == 16 and rdata and rdata[0] == rdlen - 1:
+                    return rdata[1:].decode("ascii")
         return None
 
     def connect_ip(self, ip: str, port: int = 443) -> list[tuple[str, str]]:
@@ -301,9 +306,11 @@ class _Env:
 @pytest.fixture(scope="module")
 def env(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("fakeip")
-    e = _Env(tmp).start()
-    yield e
-    e.stop()
+    e = _Env(tmp)
+    try:
+        yield e.start()
+    finally:
+        e.stop()
 
 
 # ---- 行为测试 -------------------------------------------------------------------
@@ -331,27 +338,20 @@ def test_fake_ip_lets_server_see_the_domain(env):
 
 
 def test_fake_ip_mapping_survives_restart(tmp_path):
-    """重启 sing-box 后，假 IP 与域名的对应关系仍然可用。
-
-    注意这条测试的边界：它证明「重启后可用」，但**不能**证明 cache_file 是必需的。
-    实测（sing-box 1.14.4）带不带 cache_file 行为一致 —— 重启后重新解析都会拿到同一个
-    假 IP，连它也都能还原。cache_file 的价值在于让映射跨重启保持稳定、避免应用钉住
-    旧假 IP 时连不上，属于优化而非硬性前提。
-    """
-    e = _Env(tmp_path).start()
+    """正常退出并重启后，旧假 IP 在没有重新查询 DNS 时仍能还原成域名。"""
+    e = _Env(tmp_path)
     try:
+        e.start()
         fake = e.resolve("proxy.example")
         assert fake and fake.startswith("198.18."), f"第一阶段没拿到假 IP: {fake}"
         assert e.connect_ip(fake) == [("DOMAIN", "proxy.example")], "重启前就无法还原，环境有问题"
 
         e.restart()
 
-        again = e.resolve("proxy.example")
-        assert again == fake, f"重启后假 IP 变了（{fake} -> {again}）"
-
-        # 载入映射之后，原来那个假 IP 也能还原
-        assert e.connect_ip(fake) == [("DOMAIN", "proxy.example")], \
-            "重启后假 IP 没能还原成域名"
+        # 不重新解析，直接连旧假 IP
+        targets = e.connect_ip(fake)
+        assert targets == [("DOMAIN", "proxy.example")], \
+            f"重启后旧假 IP 没能还原（映射没持久化）: {targets}"
     finally:
         e.stop()
 
@@ -382,3 +382,17 @@ def test_real_ip_is_not_reverse_mapped(env):
     """
     targets = env.connect_ip("203.0.113.11")
     assert targets == [("IPv4", "203.0.113.11")], f"真实 IP 被意外还原: {targets}"
+
+
+def test_fake_ip_keeps_upstream_aaaa_and_txt_without_ipv6_pool(env):
+    assert env.resolve("proxy.example", qtype=28) == "2001:db8::123"
+    assert env.resolve("proxy.example", qtype=16) == "fixture"
+
+
+def test_fake_ip_returns_synthetic_aaaa_with_ipv6_pool(tmp_path):
+    e = _Env(tmp_path, ipv6_range="fc00::/18")
+    try:
+        e.start()
+        assert e.resolve("proxy.example", qtype=28) == "fc00::2"
+    finally:
+        e.stop()

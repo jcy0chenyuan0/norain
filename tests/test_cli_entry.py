@@ -17,20 +17,21 @@ from norain.paths import Paths
 def cli_env() -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("NORAIN_")}
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONIOENCODING"] = "utf-8"
     env["NORAIN_NO_SYSTEM_CHANGES"] = "1"
     return env
 
 
 def test_client_module_entry_point_prints_help():
     proc = subprocess.run([sys.executable, "-m", "norain.cli", "--help"], env=cli_env(),
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8", timeout=60)
     assert proc.returncode == 0
     assert "usage" in proc.stdout.lower() or "用法" in proc.stdout
 
 
 def test_server_module_entry_point_prints_help():
     proc = subprocess.run([sys.executable, "-m", "norain_server.cli", "--help"], env=cli_env(),
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, encoding="utf-8", timeout=60)
     assert proc.returncode == 0
     assert proc.stdout.strip()
 

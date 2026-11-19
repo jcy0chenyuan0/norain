@@ -175,11 +175,18 @@ def test_warp_requires_domains_or_ip_cidr(server):
     assert "routing.warp.domains" in errs
 
 
-def test_warp_ip_cidr_is_validated(server):
+@pytest.mark.parametrize("value", ["not-a-cidr", "192.0.2.0/255.255.255.0", "192.0.2.0/024", "fe80::1%2"])
+def test_warp_ip_cidr_is_validated(server, value):
     server.write_config(extra='[routing.warp]\naddress = "127.0.0.1:40000"\n'
-                              'domains = ["claude.ai"]\nip_cidr = ["not-a-cidr"]\n')
+                              f'domains = ["claude.ai"]\nip_cidr = ["{value}"]\n')
     errs = errors_of(server)
     assert "routing.warp.ip_cidr" in errs
+
+
+def test_warp_accepts_single_target_ips(server):
+    server.write_config(extra='[routing.warp]\ndomains = []\nip_cidr = ["192.0.2.1", "2001:db8::1"]\n')
+    cfg = load_config(server.config)
+    assert cfg.routing.warp.ip_cidr == ["192.0.2.1", "2001:db8::1"]
 
 
 def test_single_protocol_and_fallback(server):

@@ -234,16 +234,22 @@ def _cross_checks(cfg: ServerConfig) -> list[FieldError]:
     warp = cfg.routing.warp
     if warp is not None:
         host, _, port = warp.address.rpartition(":")
-        if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        if not host or not port.isascii() or not port.isdecimal() or not 0 < int(port) < 65536:
             errs.append(FieldError("routing.warp.address", "必须是 host:port 形式，例如 127.0.0.1:40000"))
         if not warp.domains and not warp.ip_cidr:
             errs.append(FieldError("routing.warp.domains",
                                    "domains 和 ip_cidr 至少要写一个（TUN 下只有 IP，需要 ip_cidr）"))
         for e in warp.ip_cidr:
+            value = e.strip()
+            _, separator, prefix = value.partition("/")
+            # sing-box 接受单个 IP 或规范数字前缀，Python 还接受点分掩码和前导零。
             try:
-                ipaddress.ip_network(e.strip(), strict=False)
+                net = ipaddress.ip_network(value, strict=False)
+                if "%" in value or (separator and prefix != str(net.prefixlen)):
+                    raise ValueError
             except ValueError:
-                errs.append(FieldError("routing.warp.ip_cidr", f"{e!r} 不是合法的 IP 段，例如 104.16.0.0/12"))
+                errs.append(FieldError("routing.warp.ip_cidr",
+                                       f"{e!r} 必须是单个 IP 或 CIDR，例如 104.16.0.0/12"))
     return errs
 
 

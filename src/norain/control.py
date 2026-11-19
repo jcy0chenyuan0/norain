@@ -202,7 +202,15 @@ class Controller:
             log_file=p.log_file, log_max_bytes=cfg.logging.max_size_mb << 20,
             log_keep=cfg.logging.retain_files, log_level=cfg.logging.level,
             runner_file=p.proxy_state, last_error_file=p.last_error, stop_file=p.proxy_stop,
-            on_line=self.router.feed)
+            on_line=self.router.feed,
+            windows_console=(cfg.dns.fake_ip and cfg.proxy.traffic_mode == "tun"
+                             and self.prep.binary.path.suffix.lower() == ".exe"),
+            resolve_listeners=self._reload_listeners)
+
+    def _reload_listeners(self) -> list:
+        """重载后按磁盘上的最新配置重算监听端口（重载可能改了 dns.fake_ip 或 TUN 设置）。"""
+        from .model import load_config
+        return generate.listeners(load_config(self.paths.config))
 
     def _local_proxy(self) -> tuple[str, int]:
         listen = self.cfg.local.listen
@@ -411,7 +419,7 @@ class Controller:
     def _update_rules(self) -> None:
         try:
             px = self._local_proxy() if self.proxy.ready else None
-            rep = rules.update(self.cfg, self.paths, proxy=px)
+            rep = rules.update(self.cfg, self.paths, proxy=px, binary=self.prep.binary.path)
             self._rules_report = {**rep, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
             self.log.info("control.rules_updated", **rep)
             if rep["updated"]:

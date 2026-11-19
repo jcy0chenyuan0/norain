@@ -43,6 +43,7 @@ class Env:
             "NORAIN_SERVER_LOG": str(self.logs), "NORAIN_SERVER_SINGBOX": str(FAKE),
             "NORAIN_SERVER_BACKEND": "detached", "NORAIN_NO_SYSTEM_CHANGES": "1",
             "PYTHONPATH": str(ROOT / "src"),
+            "PYTHONIOENCODING": "utf-8",
         }
         self.write_config()
 
@@ -71,12 +72,12 @@ check_interval_seconds = {interval}
 restart_limit = {limit}
 restart_backoff_seconds = 0
 {extra}
-""")
+""", encoding="utf-8")
         self.config.chmod(0o600)
 
     def cli(self, *args, env=None, timeout=60):
         proc = subprocess.run([sys.executable, "-m", "norain_server", *args],
-                              env={**self.env, **(env or {})}, capture_output=True, text=True,
+                              env={**self.env, **(env or {})}, capture_output=True, encoding="utf-8",
                               timeout=timeout)
         return proc
 
@@ -103,20 +104,20 @@ def server(tmp_path, monkeypatch):
 _PROGRESS = {"total": 0, "done": 0, "step": 10, "enabled": False}
 
 
-def pytest_configure(config):
-    _PROGRESS["enabled"] = os.environ.get("NORAIN_TEST_PROGRESS", "") not in ("", "0")
-
-
 def pytest_addoption(parser):
     parser.addoption("--full", action="store_true", default=False,
                      help="跑全量测试，包括要等真实崩溃/重启周期的 slow 用例")
 
 
+def pytest_configure(config):
+    _PROGRESS["enabled"] = os.environ.get("NORAIN_TEST_PROGRESS", "") not in ("", "0")
+    # 只替换 pyproject.toml 的内部默认值。显式 -m（包括空表达式）已由 pytest 解析。
+    if config.option.markexpr == "__norain_default_mark_filter__":
+        config.option.markexpr = "" if config.getoption("--full") else "not slow"
+
+
 def pytest_collection_modifyitems(session, config, items):
     _PROGRESS["total"] = len(items)
-    if config.getoption("--full"):
-        # --full：把 pyproject 里默认的 "-m 'not slow'" 去掉
-        config.option.markexpr = ""
 
 
 def pytest_runtest_logreport(report):

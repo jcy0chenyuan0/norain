@@ -22,6 +22,7 @@ from pathlib import Path
 from norain_core import osutil
 from norain_core.state import read_json, write_json
 
+from .probe import ExplicitProxyHandler
 from .model import KNOWN_RULE_SETS, ClientConfig
 from .paths import Paths
 
@@ -65,8 +66,7 @@ def status(cfg: ClientConfig, paths: Paths) -> list[dict]:
 def _download(url: str, dest: Path, proxy: tuple[str, int] | None, timeout: float) -> None:
     handlers = []
     if proxy:
-        addr = f"http://{proxy[0]}:{proxy[1]}"
-        handlers.append(urllib.request.ProxyHandler({"http": addr, "https": addr}))
+        handlers.append(ExplicitProxyHandler(proxy))
     opener = urllib.request.build_opener(*handlers)
     total = 0
     with opener.open(urllib.request.Request(url, headers={"User-Agent": "norain"}), timeout=timeout) as r, \
@@ -78,8 +78,16 @@ def _download(url: str, dest: Path, proxy: tuple[str, int] | None, timeout: floa
             f.write(chunk)
 
 
+def _verify(binary: Path, path: Path) -> None:
+    """用 sing-box 校验下载文件的完整结构。"""
+    proc = osutil.run([str(binary), "rule-set", "match", "-f", "binary", str(path), "0.0.0.0"], timeout=30)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:200]
+        raise OSError(f"sing-box 无法加载规则集：{detail}")
+
+
 def update(cfg: ClientConfig, paths: Paths, *, proxy: tuple[str, int] | None = None,
-           timeout: float = 60.0, downloader=_download) -> dict:
+           timeout: float = 60.0, downloader=_download, binary: Path) -> dict:
     """下载到临时文件 → 校验 → 保留上一版 → 原子替换。任何一步失败都保留当前版本。
 
     proxy：经哪个本地入口下载（代理在运行时用 mixed-in，这样 GitHub 的地址走代理）。
@@ -101,6 +109,7 @@ def update(cfg: ClientConfig, paths: Paths, *, proxy: tuple[str, int] | None = N
             want = locked.get(name)
             if want and digest != want:
                 raise OSError(f"SHA-256 与 rules.lock.toml 不符（期望 {want}，实际 {digest}）")
+            _verify(binary, tmp)   # 结构校验：损坏的规则集不能替换掉正在用的那份
             if not want:
                 report["unpinned"].append(name)
             if dest.is_file() and hashlib.sha256(dest.read_bytes()).hexdigest() == digest:

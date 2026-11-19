@@ -59,11 +59,23 @@ def _opener(proxy: Proxy, verify: bool) -> urllib.request.OpenerDirector:
     """按（本地入口, 是否校验证书）缓存 opener：入口只有固定的几个，opener 不带连接状态。"""
     handlers: list = [urllib.request.HTTPSHandler(context=_ssl_context(verify))]
     if proxy:
-        addr = f"http://{proxy[0]}:{proxy[1]}"
-        handlers.append(urllib.request.ProxyHandler({"http": addr, "https": addr}))
+        handlers.append(ExplicitProxyHandler(proxy))
     else:
         handlers.append(urllib.request.ProxyHandler({}))  # 明确忽略系统代理和环境变量
     return urllib.request.build_opener(*handlers)
+
+
+class ExplicitProxyHandler(urllib.request.ProxyHandler):
+    """指定本地入口时，由 Norain 决定连接路径。"""
+
+    def __init__(self, proxy: tuple[str, int]) -> None:
+        host, port = proxy
+        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        super().__init__({"http": authority, "https": authority})
+
+    def proxy_open(self, req, proxy, type):
+        req.set_proxy(proxy, "http")
+        return None
 
 
 def http(url: str, *, proxy: Proxy = None, timeout: float = 5.0, via: str = "", method: str = "GET",

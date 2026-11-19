@@ -140,7 +140,7 @@ class Maintainer:
         阻断先行的原因：修复要花几秒到几十秒，这段时间流量会回落直连、暴露真实 IP。
         只放行代理服务器的修复窗口见 block.engage(repairing=True)。
         """
-        ctl, cfg = self.ctl, self.ctl.cfg
+        ctl = self.ctl
         result = {"code": code, "reason": reason, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                   "attempts": [], "outcome": ""}
         self.log.error("maintain.fault", code=code, meaning=MEANING.get(code, "代理进程无法维持"), reason=reason)
@@ -153,11 +153,14 @@ class Maintainer:
             else:
                 outcome, code = self._repair_rounds(code, reason, result)
                 if outcome == "recovered":
+                    # 修好了就继续运行：不能把原故障码传回控制器，否则它会当成失败退出，
+                    # 刚解除阻断的流量随之回落直连（等于修复后主动暴露真实 IP）。
                     if blocked:
                         self._unblock_after_repair(ctl.paths)
                     else:
                         self.log.warn("maintain.recovered_without_block", note="阻断没有生效，修复成功")
-                elif blocked:
+                    return outcome
+                if blocked:
                     outcome = "blocked"
                 ctl.request_shutdown(blocked=outcome == "blocked", code=code)
         finally:

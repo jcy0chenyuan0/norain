@@ -46,8 +46,11 @@ norain uninstall
 干净机器上可以直接用引导脚本（系统依赖 → 虚拟环境 → 安装包 → `norain-server install`）：
 
 ```bash
-sudo ./scripts/bootstrap-server.sh
+sudo bash scripts/bootstrap-server.sh
 ```
+
+（脚本在仓库里保留了可执行位，`sudo ./scripts/bootstrap-server.sh` 同样可用；
+用 `bash` 调用可以避免因 clone/拷贝丢失可执行位而失败。）
 
 已经装好 Python 与 venv 时，照常手动安装：
 

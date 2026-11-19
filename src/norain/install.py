@@ -172,7 +172,7 @@ def install(paths: Paths, *, archive: Path | None = None, sha256: str | None = N
     except NorainError as e:
         warnings.append("配置还不能用：" + ("；".join(f"{f.path} {f.message}" for f in e.field_errors) or e.message))
     if cfg is not None:
-        rep = rules.update(cfg, paths, timeout=20)
+        rep = rules.update(cfg, paths, timeout=20, binary=paths.bundled_singbox)
         if rep["failed"]:
             warnings.append("规则集暂时没有下载成功（代理启动后会自动重试）：" + "、".join(rep["failed"]))
         else:

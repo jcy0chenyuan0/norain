@@ -112,7 +112,6 @@ def test_proxy_only_still_narrower_than_full(env):
     _, cfg, _ = env
     narrow_v4, narrow_v6, _ = block.proxy_only(cfg)
     narrow = {str(n) for n in narrow_v4 + narrow_v6}
-    from norain import defaults
     # 默认监控探测目标（baidu/qq/taobao）的解析结果不应出现在修复窗口里
     assert all("baidu" not in x for x in narrow)
     assert len(narrow) < len({str(n) for n in block.allowed(cfg)[0] + block.allowed(cfg)[1]}) + 10
@@ -304,7 +303,10 @@ def test_release_failure_after_tighten_warns_user(env):
 
 def _rnd(dom, frn, *, p4="US", p6="US", d4="CN"):
     from norain.monitor import Round
-    loc = lambda c: {"ip": "x", "loc": c} if c else None
+
+    def loc(c):
+        return {"ip": "x", "loc": c} if c else None
+
     return Round(at=0, domestic=[{"ok": o, "target": t} for o, t in dom],
                  foreign=[{"ok": o, "target": t} for o, t in frn],
                  direct_v4=loc(d4), proxy_v4=loc(p4), proxy_v6=loc(p6), dns_home=None)
@@ -496,6 +498,8 @@ def test_escalate_unblocks_automatically_after_recovery(maint):
 
     assert log.has("maintain.unblocked")
     assert block.state(paths) is None      # 已经解除，状态文件被清掉
+    # 修好之后绝不能请求退出：控制器会带着原故障码退出，刚解除阻断的流量回落直连
+    assert ctl.shutdown is None
 
 
 def test_escalate_keeps_block_when_repair_fails(maint):

@@ -65,12 +65,15 @@ sing-box 1.12 重构了 DNS server 格式，旧格式在 1.14 已移除。1.14 �
 
 - fake-ip 的 DNS server 与 DNS 规则**只覆盖走代理的域名**（`proxy_domains` 与学到的代理名单）。
   直连域名和未知域名必须返回真 IP，否则应用拿到 `198.18.x.x` 既连不上、也破坏直连判定。
-- DNS 规则里 fakeip 必须排在 `dns-direct` 之前，否则先被直连规则吃掉。
+- 代理服务器自身的域名先用直连 DNS。显式名单优先于自动学习，学习名单的 fake-ip 规则放在
+  显式直连之后、学到的 hosts 缓存之前。HTTPS、TXT 等记录继续由正常上游解析。
 - `route.rules` 里为 fake-ip 段加一条 `{"ip_cidr": [...], "action": "sniff"}`，
   让它先嗅探、再按域名分流，避免被后面的 `ip_cidr` 规则当成普通 IP。
 - 只在 `traffic_mode = "tun"` 时生效：mixed / system-proxy 本来就能把域名交给服务端。
-- `fake_ip_range_v6` 默认空（不启用 IPv6 fake-ip）；需要时显式配置 `inet6_range`。
+- `fake_ip_range_v6` 默认空，此时只有 A 查询走 fake-ip，AAAA 由正常上游解析；
+  需要 IPv6 连接同样恢复域名时，配置 IPv6 fake-ip 网段。
+- 映射缓存保存在状态目录的 `singbox-cache.db`。正常停止或重载时给 sing-box 留出写盘时间，
+  Windows 客户端使用独立控制台发送 Ctrl+C。进程崩溃或被强制结束时，尚未写盘的映射可能丢失。
 
-副作用（需要知情）：fake-ip 会改变应用看到的 IP，某些按 IP 判断的逻辑（例如把连接钉死在
-某个 IP 上的客户端）可能受影响，所以**默认关闭**，按需开启。服务端侧的兜底见 ADR 0008 与
-`routing.warp.ip_cidr`（纯 IP 场景不依赖 fake-ip 也能命中 WARP）。
+fake-ip 会改变应用看到的 IP，某些按 IP 判断的逻辑可能受影响，所以**默认关闭**。
+服务端的 `routing.warp.ip_cidr` 按收到的目标 IP 分流，适用于客户端未传递域名的连接。

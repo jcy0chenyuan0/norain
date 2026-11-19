@@ -51,6 +51,6 @@ markers = [
 ]
 
 # 默认只跑必要测试：改一个配置或一行逻辑时，几十秒内就能得到反馈。
-# 跑全量用 `pytest --full`（见 tests/conftest.py 里的 addopts 处理），
-# 或显式 `pytest -m ""`。
-addopts = "-m 'not slow'"
+# pytest_configure 会把这个内部默认值替换成 not slow，或在 --full 时清空。
+# 任何来源的显式 -m 都由 pytest 自己覆盖此默认值。
+addopts = "-m __norain_default_mark_filter__"

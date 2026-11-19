@@ -16,11 +16,12 @@ import os
 import shutil
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable
 
-from norain_core import fetch, osutil, singbox
+from norain_core import atomic, fetch, osutil, singbox
 from norain_core.errors import EXIT_CONFIG, EXIT_CONFLICT, EXIT_EXTERNAL, NorainError
 from norain_core.log import new_op_id
 from norain_core.secrets import generate_to_file
@@ -440,30 +441,64 @@ def update(paths: Paths, *, archive: Path | None = None, sha256: str | None = No
     cfg = load_config(paths.config)
     was_running = get_desired(paths.desired) == RUNNING
     old_bin = backup / paths.default_singbox.name
-    try:
-        info = fetch.install_singbox(paths.default_singbox, paths.cache_dir, archive=archive,
+    # 先把更新前的运行配置和元数据复制到备份目录：prepare() 会替换它们，原地引用就丢了
+    old_json = old_meta = None
+    if paths.current_json.is_file():
+        old_json = backup / "sing-box.json"
+        shutil.copy2(paths.current_json, old_json)
+    if paths.meta_json.is_file():
+        old_meta = backup / "sing-box.json.meta.json"
+        shutil.copy2(paths.meta_json, old_meta)
+    backend = pick_backend(paths) if was_running else None
+    # 下载、解包和版本检查可以在旧服务仍运行时完成；Windows 上运行中的 EXE 不能直接替换。
+    paths.default_singbox.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".norain-update-", dir=paths.default_singbox.parent) as staging:
+        candidate = Path(staging) / paths.default_singbox.name
+        info = fetch.install_singbox(candidate, paths.cache_dir, archive=archive,
                                      expected_sha256=sha256, existing=singbox_path,
                                      need_tags=runner.need_tags(cfg))
         steps.append(f"sing-box {info.version}")
+        _activate_update(paths, candidate, backend, old_bin, old_json, old_meta, backup, steps)
+    return {"steps": steps, "backup": str(backup), "singbox_version": singbox.PINNED_VERSION}
+
+
+def _activate_update(paths: Paths, candidate: Path, backend, old_bin: Path, old_json: Path | None,
+                     old_meta: Path | None, backup: Path, steps: list[str]) -> None:
+    if backend is not None:
+        backend.stop()
+    starting = False
+    try:
+        atomic.replace(candidate, paths.default_singbox)
         prep = runner.prepare(paths, apply=True)
         steps.append(f"配置校验通过（版本 {prep.applied.version}）")
         steps.append("开机自启：" + register_autostart(paths))
         sync_ownership(paths)
-        if was_running:
-            backend = pick_backend(paths)
-            backend.stop()
+        if backend is not None:
+            starting = True
             backend.start()
             steps.append("已重启服务")
-    except NorainError:
-        if old_bin.is_file():  # 恢复旧二进制并尽量恢复服务
-            shutil.copy2(old_bin, paths.default_singbox)
-            if was_running:
+    except (NorainError, OSError) as error:
+        try:
+            if starting:
+                backend.stop()
+            if old_bin.is_file():
+                staged = paths.default_singbox.with_name(paths.default_singbox.name + ".rollback")
                 try:
-                    pick_backend(paths).start()
-                except NorainError:
-                    pass
+                    shutil.copy2(old_bin, staged)
+                    atomic.replace(staged, paths.default_singbox)
+                finally:
+                    staged.unlink(missing_ok=True)
+            else:
+                paths.default_singbox.unlink(missing_ok=True)
+            runner.restore_runtime(paths, old_json.read_bytes() if old_json else None,
+                                   old_meta.read_bytes() if old_meta else None)
+            sync_ownership(paths)
+            if backend is not None and old_json is not None:
+                backend.start()
+        except (NorainError, OSError) as recovery:
+            raise NorainError(f"更新失败，恢复旧版本也失败：{recovery}", exit_code=EXIT_EXTERNAL,
+                              module="deploy", hint=f"更新前的备份位于 {backup}") from error
         raise
-    return {"steps": steps, "backup": str(backup), "singbox_version": singbox.PINNED_VERSION}
 
 
 # ---- 卸载 ----------------------------------------------------------------------

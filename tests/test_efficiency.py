@@ -168,6 +168,26 @@ def test_supervisor_wait_wakes_on_stop_reload_and_stop_file(tmp_path):
     assert sup2._stop_requested(60) is True and time.monotonic() - t0 < 5
 
 
+def test_supervisor_reload_picks_up_new_ports(tmp_path):
+    """重载可能改了端口：健康检查必须改用新配置的端口，否则会误报旧端口没在监听。"""
+    sup = make_supervisor(tmp_path)
+    sup.spec.listeners = [("0.0.0.0", "tcp", 1111)]
+    sup.spec.resolve_listeners = lambda: [("0.0.0.0", "tcp", 2222)]
+    log = Logger("daemon", sink=RotatingFile(tmp_path / "log" / "y.log", max_bytes=1 << 20, keep=2),
+                 level="info")
+    refreshed = sup._refresh_listeners(log)
+    assert refreshed is not None and refreshed.listeners == [("0.0.0.0", "tcp", 2222)]
+
+    # 新配置读不出来时沿用旧端口，不能让守护进程崩掉
+    def boom():
+        raise ValueError("bad config")
+    sup.spec.resolve_listeners = boom
+    assert sup._refresh_listeners(log) is None
+
+    sup.spec.resolve_listeners = None   # 没有提供重新计算的钩子
+    assert sup._refresh_listeners(log) is None
+
+
 def test_supervisor_survives_a_failing_runner_file_write(tmp_path, monkeypatch):
     sup = make_supervisor(tmp_path)
     monkeypatch.setattr("norain_core.supervisor.write_json",

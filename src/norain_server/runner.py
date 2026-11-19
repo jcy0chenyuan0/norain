@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from norain_core import singbox
-from norain_core.errors import NorainError
+from norain_core import atomic, singbox
+from norain_core.errors import EXIT_CONFIG, NorainError
 from norain_core.migrate import migration_warnings
 from norain_core.secrets import Secret
+from norain_core.state import read_json
 from norain_core.supervisor import Listener, Spec, Supervisor, check_ports_free, record_error
 
 from . import cert as certmod
@@ -38,6 +39,27 @@ def listeners(cfg: ServerConfig) -> list[Listener]:
     if cfg.protocols.trojan.enabled:
         out.append((cfg.server.listen, "tcp", cfg.protocols.trojan.port))
     return out
+
+
+def runtime_listeners(paths: Paths) -> list[Listener]:
+    doc = read_json(paths.current_json)
+    if not isinstance(doc, dict):
+        raise NorainError("无法读取生效的 sing-box 配置", exit_code=EXIT_CONFIG, module="daemon")
+    protocols = {"hysteria2": "udp", "trojan": "tcp"}
+    return [(inbound["listen"], protocols[inbound["type"]], inbound["listen_port"])
+            for inbound in doc["inbounds"] if inbound["type"] in protocols]
+
+
+def restore_runtime(paths: Paths, config: bytes | None, meta: bytes | None) -> None:
+    for path, data in ((paths.current_json, config), (paths.meta_json, meta)):
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic.atomic_write(path, data)
+    if config is None:
+        paths.recovery_file.unlink(missing_ok=True)
+    else:
+        atomic.atomic_write(paths.recovery_file, generate.version_of(config).encode("ascii"))
 
 
 def locate_singbox(paths: Paths) -> singbox.BinaryInfo:
@@ -101,23 +123,36 @@ def prepare(paths: Paths, *, apply: bool = True) -> Prepared:
     if cfg.tls.mode == "acme":
         paths.acme_dir.mkdir(parents=True, exist_ok=True)
     applied = generate.apply(cfg, secret, paths, info.path) if apply else None
+    if applied is not None:
+        paths.recovery_file.unlink(missing_ok=True)
     return Prepared(cfg, paths, secret, info, status, applied)
 
 
 def run_foreground(paths: Paths) -> int:
     try:
-        prep = prepare(paths)
-        check_ports_free(listeners(prep.cfg))
+        if paths.recovery_file.is_file():
+            cfg = load_config(paths.config)
+            p = paths.with_log_dir(cfg.logging.directory)
+            binary = locate_singbox(paths).path
+            version = generate.version_of(p.current_json.read_bytes())
+            if p.recovery_file.read_text(encoding="ascii") != version:
+                raise NorainError("恢复配置与记录的版本不一致", exit_code=EXIT_CONFIG, module="daemon")
+            singbox.check(binary, p.current_json)
+        else:
+            prep = prepare(paths)
+            cfg, p, binary, version = prep.cfg, prep.paths, prep.binary.path, prep.applied.version
+        current_listeners = runtime_listeners(p)
+        check_ports_free(current_listeners)
     except NorainError as e:
         record_error(paths.last_error, e.business_code, e.message)
         raise
-    cfg, p = prep.cfg, prep.paths
     return Supervisor(Spec(
-        binary=prep.binary.path, config_json=p.current_json, config_version=prep.applied.version,
-        listeners=listeners(cfg), check_interval=cfg.service.check_interval_seconds,
+        binary=binary, config_json=p.current_json, config_version=version,
+        listeners=current_listeners, check_interval=cfg.service.check_interval_seconds,
         restart_limit=cfg.service.restart_limit, backoff=cfg.service.restart_backoff_seconds,
         log_file=p.log_file, log_max_bytes=cfg.logging.max_size_mb * 1024 * 1024,
         log_keep=cfg.logging.retain_files, log_level=cfg.logging.level,
         runner_file=p.runner, last_error_file=p.last_error, stop_file=p.stop_file,
         reload_file=p.reload_file,
+        resolve_listeners=lambda: runtime_listeners(p),
     )).run()

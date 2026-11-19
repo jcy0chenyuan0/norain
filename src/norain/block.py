@@ -190,14 +190,24 @@ class WindowsBackend:
     name = "windows-firewall"
 
     def snapshot(self) -> dict:
-        proc = osutil.powershell("Get-NetFirewallProfile | Select-Object Name,Enabled | ConvertTo-Json -Compress")
+        proc = osutil.powershell("$ErrorActionPreference = 'Stop'; "
+                                 "Get-NetFirewallProfile | Select-Object Name,Enabled | ConvertTo-Json -Compress")
         try:
             rows = json.loads(proc.stdout or "[]")
         except ValueError:
             rows = []
         rows = rows if isinstance(rows, list) else [rows]
         # Enabled 可能序列化成布尔、0/1 或 "True"/"False"
-        return {r["Name"]: str(r.get("Enabled")).lower() in ("true", "1") for r in rows if "Name" in r}
+        profiles = {r["Name"]: str(r.get("Enabled")).lower() in ("true", "1")
+                    for r in rows if isinstance(r, dict) and "Name" in r}
+        if proc.returncode != 0 or set(profiles) != {"Domain", "Private", "Public"}:
+            raise NorainError("无法读取 Windows 防火墙原始状态", exit_code=EXIT_EXTERNAL, module="block",
+                              hint=(proc.stderr or proc.stdout).strip()[:200])
+        return profiles
+
+    def rule_names(self, v4: list, v6: list) -> list[str]:
+        return [f"{PREFIX}v{ver}-{i // _CHUNK}" for ver, nets in ((4, v4), (6, v6))
+                for i in range(0, len(complement(nets, ver)), _CHUNK)]
 
     def apply(self, v4: list, v6: list) -> list[str]:
         names: list[str] = []
@@ -217,17 +227,23 @@ class WindowsBackend:
 
     def remove(self, state: dict) -> list[str]:
         errors = []
-        proc = osutil.powershell(f"Get-NetFirewallRule -DisplayName '{PREFIX}*' -ErrorAction SilentlyContinue "
-                                 "| Remove-NetFirewallRule")
+        proc = osutil.powershell(
+            "$ErrorActionPreference = 'Stop'; "
+            f"Get-NetFirewallRule | Where-Object DisplayName -Like '{PREFIX}*' | Remove-NetFirewallRule")
         if proc.returncode != 0:
             # PowerShell 不可用时逐条用 netsh 删除记录在案的规则
+            if not state.get("rules"):
+                errors.append("无法枚举或删除 Windows 阻断规则，状态中没有可用于清理的规则名")
             for name in state.get("rules", []):
                 p = osutil.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"])
-                if p.returncode != 0 and "No rules match" not in p.stdout and "没有与" not in p.stdout:
-                    errors.append(f"删除规则 {name} 失败：{(p.stderr or p.stdout).strip()[:200]}")
+                detail = (p.stderr or p.stdout).strip()[:200]
+                if p.returncode != 0 and "No rules match" not in detail and "没有与" not in detail:
+                    errors.append(f"删除规则 {name} 失败：{detail}")
         for profile, enabled in (state.get("firewall_profiles") or {}).items():
             if not enabled:
-                osutil.run(["netsh", "advfirewall", "set", f"{profile.lower()}profile", "state", "off"])
+                p = osutil.run(["netsh", "advfirewall", "set", f"{profile.lower()}profile", "state", "off"])
+                if p.returncode != 0:
+                    errors.append(f"还原防火墙配置 {profile} 失败：{(p.stderr or p.stdout).strip()[:200]}")
         return errors
 
     def present(self) -> bool:
@@ -264,7 +280,8 @@ class NftBackend:
 
     def remove(self, state: dict) -> list[str]:
         proc = osutil.run(["nft", "delete", "table", "inet", NFT_TABLE])
-        if proc.returncode != 0 and self.present():
+        # nft 用 ENOENT 表示不存在；权限错误或命令缺失无法证明规则已删除。
+        if proc.returncode != 0 and "No such file or directory" not in proc.stderr:
             return [f"删除 nftables 表失败：{(proc.stderr or proc.stdout).strip()[:200]}"]
         return []
 
@@ -329,11 +346,26 @@ def engage(cfg: ClientConfig, paths: Paths, *, code: int, reason: str, log: Logg
         "restore_command": "norain block off",
         "manual_restore": MANUAL_RESTORE["nt" if osutil.IS_WINDOWS else "posix"],
     }
+    if isinstance(be, WindowsBackend):
+        st["rules"] = be.rule_names(v4, v6)
     write_json(paths.block_state, st)  # 先落盘：即使应用到一半崩溃，解除命令也知道要清理什么
     try:
         st["rules"] = be.apply(v4, v6)
     except NorainError:
-        be.remove(st)
+        # 回滚。清理有残留时绝不能删状态文件：它既是「还有阻断规则」的记录，
+        # 也带着 Windows 防火墙原始状态；删掉就等于既留着阻断规则又丢失了恢复依据。
+        left = be.remove(st)
+        if left:
+            st["cleanup_errors"] = left
+            write_json(paths.block_state, st)
+            if log:
+                log.error("block.rollback_incomplete", errors=left)
+            raise NorainError(
+                "进入阻断模式失败，并且回滚没有清理干净："
+                + "；".join(left[:3])
+                + "\n系统里可能残留阻断规则。运行 norain block off 重试清理",
+                exit_code=EXIT_EXTERNAL, module="block",
+                hint="运行 norain block off；仍失败时按状态文件里的手工恢复命令处理") from None
         paths.block_state.unlink(missing_ok=True)
         raise
     write_json(paths.block_state, st)

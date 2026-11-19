@@ -1,4 +1,4 @@
-﻿"""客户端（阶段 2）测试。生命周期部分使用模拟 sing-box。"""
+"""客户端（阶段 2）测试。生命周期部分使用模拟 sing-box。"""
 
 import json
 import os
@@ -31,7 +31,7 @@ class Client:
         self.port = free_port()
         self.env = {**{k: v for k, v in os.environ.items() if not k.startswith(("NORAIN_", "FAKE_SB_"))},
                     "NORAIN_HOME": str(self.home), "NORAIN_STATE": str(self.state),
-                    "NORAIN_SINGBOX": str(FAKE), "PYTHONPATH": str(ROOT / "src"),
+                    "NORAIN_SINGBOX": str(FAKE), "PYTHONPATH": str(ROOT / "src"), "PYTHONIOENCODING": "utf-8",
                     "NORAIN_NO_SYSTEM_CHANGES": "1"}
         self.write()
 
@@ -67,12 +67,12 @@ restart_limit = {limit}
 backoff_seconds = 0
 {self.BASE if base else ""}
 {extra}
-""")
+""", encoding="utf-8")
         self.config.chmod(0o600)
 
     def cli(self, *args, env=None):
         return subprocess.run([sys.executable, "-m", "norain", *args], env={**self.env, **(env or {})},
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, encoding="utf-8", timeout=60)
 
     def status(self):
         return json.loads(self.cli("status", "--json").stdout)
@@ -168,19 +168,53 @@ def test_fake_ip_enabled_for_tun(client):
     """
     client.write(protocol="hysteria2", proxy_extra='traffic_mode = "tun"', base=False,
                  extra='[dns]\nfake_ip = true\n'
-                       '[routing]\nproxy_domains = ["claude.ai", "google.com"]\n'
+                       '[routing]\nproxy_domains = ["claude.ai", "google.com", "example.test"]\n'
                        'direct_domains = ["baidu.com"]')
     doc = generate.build(load_config(client.config), PASSWORD)
     fake = next(s for s in doc["dns"]["servers"] if s.get("type") == "fakeip")
     assert fake["tag"] == "dns-fakeip" and fake["inet4_range"] == "198.18.0.0/15"
-    # 只对白名单域名启用
-    first = doc["dns"]["rules"][0]
-    assert first["server"] == "dns-fakeip"
-    assert set(first["domain_suffix"]) == {"claude.ai", "google.com"}
+    # 代理服务器自身的精确匹配优先，即使它也命中显式代理名单
+    endpoint, fake_rule, *_ = doc["dns"]["rules"]
+    assert endpoint == {"domain": ["example.test"], "action": "route", "server": "dns-direct"}
+    assert fake_rule["server"] == "dns-fakeip"
+    assert set(fake_rule["domain_suffix"]) == {"claude.ai", "google.com", "example.test"}
     # 直连域名不能走 fake-ip
     assert {"domain_suffix": ["baidu.com"], "action": "route", "server": "dns-direct"} in doc["dns"]["rules"]
     # fake-ip 段的流量要单独嗅探后再按域名分流
     assert {"ip_cidr": ["198.18.0.0/15"], "action": "sniff"} in doc["route"]["rules"]
+    # 只拦地址查询，否则 HTTPS/TXT 之类进 fake-ip 解析器会拿不到应答
+    assert fake_rule["query_type"] == ["A"]
+
+
+def test_fake_ip_covers_learned_proxy_domains_after_explicit_direct(client):
+    """自动学到的代理域名也要有 fake-ip，但必须排在显式直连规则之后。
+
+    ADR 0006：fake-ip 覆盖显式代理和自动学到的代理两类域名。
+    ADR 0007：显式名单优先于自动学习 —— 学到的记录可能已过时，用户把同一域名加进
+    direct_domains 后必须以显式直连为准。
+    两者叠起来的结果就是：学到的 fakeip 规则要落在显式直连规则之后。
+    """
+    client.write(protocol="hysteria2", proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\n'
+                       '[routing]\nproxy_domains = ["explicit.example"]\n'
+                       'direct_domains = ["direct.example"]')
+    doc = generate.build(load_config(client.config), PASSWORD,
+                         learned={"proxy": ["learned.example", "sub.direct.example"],
+                                  "hosts": {"learned.example": ["192.0.2.1"],
+                                            "sub.direct.example": ["192.0.2.2"]}})
+    rules = doc["dns"]["rules"]
+    fake_explicit = next(i for i, r in enumerate(rules) if r.get("server") == "dns-fakeip"
+                         and r.get("domain_suffix") == ["explicit.example"])
+    direct_explicit = next(i for i, r in enumerate(rules) if r.get("server") == "dns-direct"
+                           and r.get("domain_suffix") == ["direct.example"])
+    fake_learned = next(i for i, r in enumerate(rules) if r.get("server") == "dns-fakeip"
+                        and r.get("domain_suffix") == ["learned.example", "sub.direct.example"])
+    cached = next(i for i, r in enumerate(rules) if r.get("server") == "dns-hosts"
+                  and r.get("domain") == ["learned.example", "sub.direct.example"])
+    proxy_learned = next(i for i, r in enumerate(rules) if r.get("server") == "dns-proxy"
+                         and r.get("domain_suffix") == ["learned.example", "sub.direct.example"])
+    assert fake_explicit < direct_explicit < fake_learned < proxy_learned < cached
+    assert rules[cached]["query_type"] == ["A", "AAAA"]
 
 
 def test_fake_ip_off_by_default(client):
@@ -192,11 +226,7 @@ def test_fake_ip_off_by_default(client):
 
 
 def test_fake_ip_requires_cache_file(monkeypatch):
-    """fake-ip 的「假 IP → 域名」映射靠 experimental.cache_file 持久化。
-
-    不开的话 sing-box 日志会报 `missing fakeip record`，应用拿到假 IP 后直接连不上 ——
-    比不开 fake-ip 还糟。这条测试锁住「启用 fake-ip 必须同时启用 cache_file」。
-    """
+    """启用 fake-ip 时，将映射缓存写入 Norain 状态目录。"""
     monkeypatch.setenv("NORAIN_TEST_PW", "pw1234567890")
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -213,6 +243,7 @@ def test_fake_ip_requires_cache_file(monkeypatch):
         doc = json.loads(generate.render(cfg, generate.resolve_secret(cfg), paths))
         cache = doc["experimental"]["cache_file"]
         assert cache["enabled"] is True
+        assert cache["store_fakeip"] is True
         # 必须落在状态目录里，否则重启后映射丢失
         assert Path(cache["path"]) == paths.state / "singbox-cache.db"
 
@@ -242,6 +273,68 @@ def test_fake_ip_v6_range(client):
     fake = next(s for s in doc["dns"]["servers"] if s.get("type") == "fakeip")
     assert fake["inet6_range"] == "fc00::/18"
     assert {"ip_cidr": ["198.18.0.0/15", "fc00::/18"], "action": "sniff"} in doc["route"]["rules"]
+    assert any(rule.get("query_type") == ["A", "AAAA"] for rule in doc["dns"]["rules"]
+               if rule["server"] == "dns-fakeip")
+
+
+def test_invalid_dns_url_reports_field_error(client):
+    client.write(base=False, extra='[dns]\nproxy = "https://[2001:db8::1/dns-query"')
+    assert "dns.proxy" in errs(client)
+
+
+def test_invalid_monitor_url_reports_field_error(client):
+    client.write(base=False, extra='[monitor]\nforeign_targets = ["https://[::1"]')
+    assert "monitor.foreign_targets" in errs(client)
+
+
+def test_fake_ip_ranges_are_validated(client):
+    """fake-ip 网段要在配置校验阶段就把错误拦下来，而不是等 sing-box 读配置时才报。"""
+    # 格式不对
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range = "not-a-cidr"\n'
+                       '[routing]\nproxy_domains = ["a.example"]')
+    assert "dns.fake_ip_range" in errs(client)
+
+    # 点分掩码：python 认，sing-box 不认
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range = "198.18.0.0/255.254.0.0"\n'
+                       '[routing]\nproxy_domains = ["a.example"]')
+    assert "dns.fake_ip_range" in errs(client)
+
+    # Python 接受前缀长度的前导零，sing-box 的 netip.ParsePrefix 不接受。
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range = "198.18.0.0/015"')
+    assert "dns.fake_ip_range" in errs(client)
+
+    # 覆盖本地网段：这些地址会被当成假 IP，查不到映射就断连
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range = "192.168.0.0/16"\n'
+                       '[routing]\nproxy_domains = ["a.example"]')
+    assert "dns.fake_ip_range" in errs(client)
+
+    # IPv6 字段写成 IPv4
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range_v6 = "198.18.0.0/15"\n'
+                       '[routing]\nproxy_domains = ["a.example"]')
+    assert "dns.fake_ip_range_v6" in errs(client)
+
+    # 有效的 ULA 也不能覆盖实际配置的 TUN 网段
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range_v6 = "fdfe:dcba:9876::/126"')
+    assert "dns.fake_ip_range_v6" in errs(client)
+
+    # 过小的网段会让 sing-box 分配出段外地址。
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nfake_ip = true\nfake_ip_range = "198.18.0.0/31"')
+    assert "dns.fake_ip_range" in errs(client)
+
+
+def test_fake_ip_rejected_in_local_dns_mode(client):
+    """local 模式只用系统 DNS，fake_ip 不会生效，配置阶段就该报错而不是静默忽略。"""
+    client.write(proxy_extra='traffic_mode = "tun"', base=False,
+                 extra='[dns]\nmode = "local"\nfake_ip = true\n'
+                       '[routing]\nproxy_domains = ["a.example"]')
+    assert "dns.fake_ip" in errs(client)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="断言的是 POSIX 路径字符串，Windows 上 Path 会渲染成反斜杠")

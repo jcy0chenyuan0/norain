@@ -281,6 +281,84 @@ def entry_key(e: str) -> str:
     return s[5:] if s.startswith("full:") else s.lstrip(".")
 
 
+# fake-ip 分配段不能覆盖这些地址：它们在真实网络里被使用，一旦被当成假 IP，
+# sing-box 会在常规路由之前先查 fakeip 表，查不到就直接断连
+# （见 route.go 的 prepareMatchMetadata）。
+#
+# IPv6 ULA 也用于 fake-ip，因此只另行排除配置中实际使用的 TUN 网段。
+_FAKEIP_FORBIDDEN = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("ff00::/8"),
+)
+
+
+def _check_fakeip_ranges(cfg: ClientConfig) -> list[FieldError]:
+    """校验 fake_ip_range / fake_ip_range_v6。
+
+    三件事：格式合法、地址族正确、不与真实在用的地址重叠。
+    否则错误会推迟到 sing-box 读配置时才暴露，或者更糟 —— 运行时把内网地址当假 IP 断连。
+    """
+    dns = cfg.dns
+    errs: list[FieldError] = []
+    checks = (
+        ("dns.fake_ip_range", dns.fake_ip_range, 4, True),
+        ("dns.fake_ip_range_v6", dns.fake_ip_range_v6, 6, False),
+    )
+    # 真正在用的：固定保留段 + 用户配置的 TUN 网段（漏掉后者会让 TUN 自身地址被当假 IP）
+    forbidden = list(_FAKEIP_FORBIDDEN)
+    for entry in cfg.tun.address:
+        try:
+            iface = ipaddress.ip_interface(entry.strip())
+        except ValueError:
+            continue  # 格式错误由 tun.address 自己的校验负责
+        forbidden.append(iface.network)
+
+    for field, raw, version, required in checks:
+        value = (raw or "").strip()
+        if not value:
+            if required:
+                errs.append(FieldError(field, "fake_ip 开启时不能为空，例如 198.18.0.0/15"))
+            continue
+        _, separator, prefix = value.partition("/")
+        if not separator or "%" in value:
+            example = "198.18.0.0/15" if version == 4 else "fc00::/18"
+            errs.append(FieldError(field, f"{raw!r} 必须写成地址/前缀长度，例如 {example}"))
+            continue
+        try:
+            net = ipaddress.ip_network(value)
+            if prefix != str(net.prefixlen):  # sing-box 只接受十进制前缀长度，不接受前导零或掩码
+                raise ValueError("前缀长度必须用十进制数字表示，不能带前导零")
+        except ValueError as e:
+            errs.append(FieldError(field, f"{raw!r} 不是合法的网段：{e}"))
+            continue
+        if net.version != version:
+            want = "IPv4" if version == 4 else "IPv6"
+            errs.append(FieldError(field, f"{raw!r} 不是 {want} 网段"))
+            continue
+        # sing-box 从网段的第三个地址开始分配，并跳过最后一个地址。
+        if net.num_addresses < 4:
+            errs.append(FieldError(field, f"{raw!r} 至少要包含 4 个地址才可分配假 IP"))
+            continue
+        for bad in forbidden:
+            if bad.version != net.version:
+                continue
+            if net.overlaps(bad):
+                errs.append(FieldError(field, f"{raw!r} 与 {bad} 重叠；这是真实在用的地址，"
+                                              "fake-ip 不能覆盖它，否则这些地址会被当成假 IP 而断连"))
+                break
+    return errs
+
+
 def _cross_checks(cfg: ClientConfig) -> list[FieldError]:
     errs: list[FieldError] = []
     if cfg.proxy.traffic_mode == "transparent":
@@ -313,13 +391,17 @@ def _cross_checks(cfg: ClientConfig) -> list[FieldError]:
         ipaddress.ip_address(cfg.dns.domestic)
     except ValueError:
         errs.append(FieldError("dns.domestic", "必须是 IP 地址，例如 223.5.5.5"))
+    if cfg.dns.fake_ip and cfg.proxy.traffic_mode == "tun":
+        if cfg.dns.mode == "local":
+            errs.append(FieldError("dns.fake_ip", "fake_ip 需要 dns.mode 为 split 或 proxy"))
+        errs.extend(_check_fakeip_ranges(cfg))
     for name in ("proxy", "domestic_doh", "public_doh"):
         value = getattr(cfg.dns, name)
-        u = urlsplit(value)
         try:
-            u.port          # 非法端口（例如 :bad）会让 urlsplit 抛 ValueError
+            u = urlsplit(value)
+            u.port  # 访问 port 时才会校验格式和范围。
         except ValueError:
-            errs.append(FieldError(f"dns.{name}", "端口不是有效的数字"))
+            errs.append(FieldError(f"dns.{name}", "URL 的主机或端口无效"))
             continue
         is_ip = False
         try:
@@ -331,7 +413,13 @@ def _cross_checks(cfg: ClientConfig) -> list[FieldError]:
             errs.append(FieldError(f"dns.{name}", "必须是 https://… 地址" + ("或 IP 地址" if name == "proxy" else "")))
     for name in ("domestic_targets", "foreign_targets"):
         for t in getattr(cfg.monitor, name):
-            if urlsplit(t).scheme not in ("http", "https"):
+            try:
+                u = urlsplit(t)
+                u.port
+            except ValueError:
+                errs.append(FieldError(f"monitor.{name}", f"{t!r} 的主机或端口无效"))
+                continue
+            if u.scheme not in ("http", "https") or not u.hostname:
                 errs.append(FieldError(f"monitor.{name}", f"{t!r} 必须是 http(s):// 地址"))
     if cfg.monitor.enabled and not (cfg.monitor.domestic_targets and cfg.monitor.foreign_targets):
         errs.append(FieldError("monitor", "启用监控时 domestic_targets 和 foreign_targets 都不能为空"))

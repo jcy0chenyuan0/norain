@@ -132,9 +132,9 @@ def _domain_match(entries: list[str]) -> dict:
 
 def _fakeip_servers(cfg: ClientConfig) -> list[dict]:
     """fake-ip 的 server 定义。只包含让哪些查询走假 IP 所需的那一个 server。"""
-    srv: dict = {"type": "fakeip", "tag": "dns-fakeip", "inet4_range": cfg.dns.fake_ip_range}
-    if cfg.dns.fake_ip_range_v6:
-        srv["inet6_range"] = cfg.dns.fake_ip_range_v6
+    srv: dict = {"type": "fakeip", "tag": "dns-fakeip", "inet4_range": cfg.dns.fake_ip_range.strip()}
+    if inet6_range := cfg.dns.fake_ip_range_v6.strip():
+        srv["inet6_range"] = inet6_range
     return [srv]
 
 
@@ -150,31 +150,41 @@ def _dns(cfg: ClientConfig, learned: dict, geosite_tags: list[str], strategy: st
         _dns_server("dns-proxy", cfg.dns.proxy, detour="proxy", resolver="dns-direct"),
     ]
     rules: list[dict] = []
+    use_fakeip = cfg.dns.fake_ip and cfg.proxy.traffic_mode == "tun"
+
+    def add(entries: list[str], server: str, **conditions) -> None:
+        m = _domain_match(entries)
+        if m:
+            rules.append({**m, **conditions, "action": "route", "server": server})
+
     hosts = learned.get("hosts") or {}
-    if hosts:  # 分流模块更新过的解析结果
+    hosts_rule = {"domain": sorted(hosts), "query_type": ["A", "AAAA"],
+                  "action": "route", "server": "dns-hosts"}
+    if hosts:
         servers.append({"type": "hosts", "tag": "dns-hosts", "predefined": dict(sorted(hosts.items()))})
-        rules.append({"domain": sorted(hosts), "action": "route", "server": "dns-hosts"})
+        # dns-hosts 是自动学到的缓存，必须排在代理服务器和所有显式名单之后（见下），
+        # 否则用户刚改的名单会被旧缓存盖住，直到缓存过期。
     if not _is_ip(cfg.proxy.server):  # 代理服务器自己的域名必须直连解析，否则死循环
         rules.append({"domain": [cfg.proxy.server.lower()], "action": "route", "server": "dns-direct"})
 
-    def add(entries: list[str], server: str) -> None:
-        m = _domain_match(entries)
-        if m:
-            rules.append({**m, "action": "route", "server": server})
-
-    # fake-ip：只对「走代理」的域名返回假 IP。
-    # 直连域名和未知域名必须给真 IP，否则应用拿到的 198.18.x.x 既连不上、也破坏直连判定。
-    # 规则顺序上 fakeip 必须排在 dns-direct 之前，所以先算出走代理的条目再插入。
-    if cfg.dns.fake_ip and cfg.proxy.traffic_mode == "tun":
+    # 代理服务器解析优先于名单；显式名单优先于自动学习。
+    # 学习得出的真实 IP 缓存只在以上规则没有处理请求时使用。
+    learned_proxy = learned.get("proxy") or []
+    # 未配置 IPv6 池时，sing-box 的 fakeip 解析器会给 AAAA 返回空应答。
+    # 只接管已有地址池的类型，其余记录由常规上游解析。
+    fake_query_types = ["A", "AAAA"] if cfg.dns.fake_ip_range_v6.strip() else ["A"]
+    if use_fakeip:
         servers.extend(_fakeip_servers(cfg))
-        proxy_entries = list(cfg.routing.proxy_domains) + list(learned.get("proxy") or [])
-        fakeip_rule = _domain_match(proxy_entries)
-        if fakeip_rule:
-            rules.insert(0, {**fakeip_rule, "action": "route", "server": "dns-fakeip"})
-
+        add(cfg.routing.proxy_domains, "dns-fakeip", query_type=fake_query_types)
     add(cfg.routing.proxy_domains, "dns-proxy")     # 白名单：恒用服务器侧解析
     add(cfg.routing.direct_domains, "dns-direct")   # 黑名单：国内 DNS
-    add(learned.get("proxy") or [], "dns-proxy")
+    if hosts and not use_fakeip:
+        rules.append(hosts_rule)
+    if use_fakeip:
+        add(learned_proxy, "dns-fakeip", query_type=fake_query_types)
+    add(learned_proxy, "dns-proxy")
+    if hosts and use_fakeip:
+        rules.append(hosts_rule)
     add(learned.get("direct") or [], "dns-direct")
     if cfg.dns.mode == "split":
         if geosite_tags:
@@ -235,7 +245,9 @@ def build(cfg: ClientConfig, password: str, *, active: str | None = None, learne
     # fake-ip 段的流量必须在「嗅探」之后按域名分流，不能被下面的 ip_cidr 规则当成普通 IP 匹配。
     # 放在 ip_is_private 之后、名单规则之前：此时 sniff 已经拿到域名，按域名走默认动作即可。
     if cfg.dns.fake_ip and tun:
-        fake_nets = [cfg.dns.fake_ip_range] + ([cfg.dns.fake_ip_range_v6] if cfg.dns.fake_ip_range_v6 else [])
+        fake_nets = [cfg.dns.fake_ip_range.strip()]
+        if inet6_range := cfg.dns.fake_ip_range_v6.strip():
+            fake_nets.append(inet6_range)
         route_rules.append({"ip_cidr": fake_nets, "action": "sniff"})
 
     def add(entries: list[str], outbound: str) -> None:
@@ -269,12 +281,12 @@ def build(cfg: ClientConfig, password: str, *, active: str | None = None, learne
         "route": route,
     }
     # cache_file 让 fake-ip 的「假 IP -> 域名」映射跨进程重启保持稳定。
-    # 实测（sing-box 1.14.4）：不启用它，同一个进程内以及重启后重新解析都能正常工作；
-    # 但重启后若应用直接连接旧假 IP（不先解析），没有持久化映射时反查会失败，日志报
-    # `missing fakeip record`。开着能避免这种「钉死旧 IP 就断」的情况，代价是一个小文件。
+    # store_fakeip 必须显式打开（默认 false）：只开 cache_file 的话映射仍只存在内存里，
+    # 重启后应用拿旧假 IP 直接连接会失败，直到它重新查询 DNS。
     if cfg.dns.fake_ip and tun:
         doc["experimental"] = {
-            "cache_file": {"enabled": True, "path": cache_path or "norain-cache.db"},
+            "cache_file": {"enabled": True, "store_fakeip": True,
+                           "path": cache_path or "norain-cache.db"},
         }
     return doc
 

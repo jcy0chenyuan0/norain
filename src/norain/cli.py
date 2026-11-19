@@ -573,7 +573,8 @@ def cmd_once(args, paths: Paths) -> int:
             resp = control.send(paths, {"op": "rules-update"}, timeout=180)
             rep = resp.get("result") or {}
         else:
-            rep = rules.update(load_config(paths.config), paths)
+            rep = rules.update(load_config(paths.config), paths,
+                               binary=runner.locate_singbox(paths).path)
         _out(args, rep, f"已更新：{'、'.join(rep.get('updated', [])) or '无'}；未变化："
              f"{'、'.join(rep.get('unchanged', [])) or '无'}"
              + "".join(f"\n失败 {k}：{v}" for k, v in (rep.get("failed") or {}).items()))

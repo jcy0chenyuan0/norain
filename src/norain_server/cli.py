@@ -21,13 +21,15 @@ from pathlib import Path
 
 from norain_core import apply as core_apply
 from norain_core import atomic, cliutil, osutil, singbox
+from norain_core.daemonctl import alive, runner_info
 from norain_core.errors import (BIZ_BINARY_MISSING, BIZ_CERT, BIZ_OK, BIZ_PROCESS_EXITED,
                                 BIZ_RESTART_LIMIT, EXIT_CONFIG, EXIT_DEPENDENCY, EXIT_FAILURE,
-                                EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, NorainError)
+                                EXIT_EXTERNAL, EXIT_OK, EXIT_TIMEOUT, EXIT_USAGE, NorainError)
 from norain_core.log import new_op_id
 from norain_core.migrate import migration_warnings
 from norain_core.secrets import generate_to_file
 from norain_core.state import RUNNING, STOPPED, get_desired, op_lock, read_json, set_desired
+from norain_core.supervisor import check_ports_free
 
 from . import cert as certmod
 from . import deploy, firewall, generate, runner
@@ -166,7 +168,12 @@ def cmd_start(args, paths: Paths) -> int:
     with op_lock(paths.lock, op="start", op_id=op_id):
         runner.prepare(paths, apply=False)  # 先在前台报出配置和证书问题
         set_desired(paths.desired, RUNNING, op_id=op_id)
+        # root 写出的期望状态文件是 root 所有、0600；systemd 的 ExecCondition 以 norain 用户读它，
+        # 读不到会当成 stopped 跳过启动。必须在 systemctl start 之前就把属主交还服务用户。
+        deploy.sync_ownership(paths)
         backend = pick_backend(paths)
+        if backend.status().state != "running":
+            paths.recovery_file.unlink(missing_ok=True)
         try:
             backend.start()
         except NorainError as e:
@@ -190,34 +197,72 @@ def cmd_stop(args, paths: Paths) -> int:
 def cmd_restart(args, paths: Paths) -> int:
     op_id = new_op_id()
     with op_lock(paths.lock, op="restart", op_id=op_id):
-        runner.prepare(paths, apply=False)  # 新配置无效时不动正在运行的服务
+        prep = runner.prepare(paths, apply=False)
+        core_apply.check_only(generate.render(prep.cfg, prep.secret, prep.paths), paths.run_dir, prep.binary.path)
         backend = pick_backend(paths)
         backend.stop()
+        paths.recovery_file.unlink(missing_ok=True)
         set_desired(paths.desired, RUNNING, op_id=op_id)
+        deploy.sync_ownership(paths)   # 同 cmd_start：启动前先把状态文件交给服务用户
         backend.start()
     _out(args, {"state": "running", "backend": backend.name, "op_id": op_id}, "已重启")
     return EXIT_OK
+
+
+def _reload_child(paths: Paths, op_id: str, version: str) -> None:
+    old = runner_info(paths.runner)
+    atomic.atomic_write(paths.reload_file, op_id.encode("ascii"), durable=False)
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            info = runner_info(paths.runner)
+            child = info.get("child_pid")
+            if (not paths.reload_file.exists() and child != old.get("child_pid")
+                    and info.get("ready") and info.get("config_version") == version and alive(child)):
+                return
+            if old and not alive(old.get("pid")) and not info:
+                error = read_json(paths.last_error) or {}
+                raise NorainError(error.get("message", "监督器在重载期间退出"),
+                                  exit_code=EXIT_EXTERNAL, module="daemon")
+            time.sleep(0.2)
+        raise NorainError("重载超时：新 sing-box 子进程未就绪", exit_code=EXIT_TIMEOUT, module="daemon")
+    finally:
+        paths.reload_file.unlink(missing_ok=True)
 
 
 def cmd_reload(args, paths: Paths) -> int:
     """重新检查证书并加载新配置。只重启 sing-box 子进程，不重启系统服务，也不计入失败次数。"""
     op_id = new_op_id()
     with op_lock(paths.lock, op="reload", op_id=op_id):
-        prep = runner.prepare(paths, apply=True)  # 证书无效或 check 不通过时在这里中止，旧配置保留
-        running = pick_backend(prep.paths).status().state == "running"
+        prep = runner.prepare(paths, apply=False)
+        backend = pick_backend(prep.paths)
+        running = backend.status().state == "running"
         if running:
-            paths.reload_file.parent.mkdir(parents=True, exist_ok=True)
-            paths.reload_file.write_text(op_id, encoding="utf-8")
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline and paths.reload_file.exists():
-                time.sleep(0.2)
-            if paths.reload_file.exists():
-                paths.reload_file.unlink(missing_ok=True)
-                raise NorainError("守护进程没有响应重载请求", exit_code=6, module="daemon", retryable=True,
-                                  hint="运行 norain-server restart")
+            old_config = paths.current_json.read_bytes()
+            old_meta = paths.meta_json.read_bytes() if paths.meta_json.is_file() else None
+            used_ports = {(proto, port) for _, proto, port in runner.runtime_listeners(paths)}
+            check_ports_free([entry for entry in runner.listeners(prep.cfg) if entry[1:] not in used_ports])
+        applied = generate.apply(prep.cfg, prep.secret, prep.paths, prep.binary.path)
+        paths.recovery_file.unlink(missing_ok=True)
+        if running:
+            try:
+                deploy.sync_ownership(paths)
+                _reload_child(paths, op_id, applied.version)
+            except (NorainError, OSError) as error:
+                try:
+                    runner.restore_runtime(paths, old_config, old_meta)
+                    deploy.sync_ownership(paths)
+                    if runner_info(paths.runner):
+                        _reload_child(paths, op_id, generate.version_of(old_config))
+                    else:
+                        backend.start()
+                except (NorainError, OSError) as recovery:
+                    raise NorainError(f"重载失败，旧配置恢复也失败：{recovery}", exit_code=EXIT_EXTERNAL,
+                                      module="daemon") from error
+                raise
     warnings = prep.warnings
-    _out(args, {"reloaded": running, "config_version": prep.applied.version,
-                "config_changed": prep.applied.changed, "warnings": warnings, "op_id": op_id},
+    _out(args, {"reloaded": running, "config_version": applied.version,
+                "config_changed": applied.changed, "warnings": warnings, "op_id": op_id},
          ("已重载" if running else "服务没有运行，只更新了配置文件")
          + "".join(f"\n警告：{w}" for w in warnings))
     return EXIT_OK
